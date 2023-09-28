@@ -69,20 +69,38 @@ import gzip
 from time import time, sleep
 from select import select
 
+V7_VERSION = struct.pack("i", 7)
 V6_VERSION = struct.pack("i", 6)
 V5_VERSION = struct.pack("i", 5)
 CLASSICAL_INPUT = struct.pack("i", 1)
 V4_VERSION = struct.pack("i", 4)
 V3_VERSION = struct.pack("i", 3)
+V7_STRUCT_STRING = "4si7432s832sBBBBBBBbfffffffffffffffIHHfff768si"
 V6_STRUCT_STRING = "4si7432s832sBBBBBBBbfffffffffffffffIHHff"
 V5_STRUCT_STRING = "4si7432s832sBBBBBBBbfffffff"
 V4_STRUCT_STRING = "4s7432s832sBBBBBBBbffff"
 V3_STRUCT_STRING = "4s7432s832sBBBBBBBb"
 
+# STRUCT_STRINGS = {3: V3_STRUCT_STRING, 4: V4_STRUCT_STRING} # ...
+
+v7_struct = struct.Struct(V7_STRUCT_STRING)
+v6_struct = struct.Struct(V6_STRUCT_STRING)
+v5_struct = struct.Struct(V5_STRUCT_STRING)
+v4_struct = struct.Struct(V4_STRUCT_STRING)
+v3_struct = struct.Struct(V3_STRUCT_STRING)
+
 
 def reverse_expand_bits(plane):
     return np.unpackbits(np.array([plane], dtype=np.uint8))[::-1].astype(
         np.float32).tobytes()
+
+def reverse_board(planes):
+    # planes is 12 * 8 = 96 bytes
+    planes = bytearray(planes)
+    for i in range(12):
+        planes[i*8:(i+1)*8] = planes[i*8:(i+1)*8][::-1]
+    planes[:48], planes[48:] = planes[48:], planes[:48]
+    return planes
 
 
 # Interface for a chunk data source.
@@ -243,6 +261,7 @@ class ChunkParserInner:
         struct.Struct doesn"t pickle, so it needs to be separately
         constructed in workers.
         """
+        self.v7_struct = struct.Struct(V7_STRUCT_STRING)
         self.v6_struct = struct.Struct(V6_STRUCT_STRING)
         self.v5_struct = struct.Struct(V5_STRUCT_STRING)
         self.v4_struct = struct.Struct(V4_STRUCT_STRING)
@@ -411,6 +430,180 @@ class ChunkParserInner:
 
         return (planes, probs, winner, best_q, plies_left, q_st, played_idx)
 
+    def convert_v7_to_tuple(self, content):
+        """
+        Unpack a v7 binary record to 5-tuple (state, policy pi, result, q, m)
+
+        v7 struct format is (8356 bytes total):
+                                  size         1st byte index
+        uint32_t version;                               0
+        uint32_t input_format;                          4
+        float probabilities[1858];  7432 bytes          8
+        uint64_t planes[104];        832 bytes       7440
+        uint8_t castling_us_ooo;                     8272
+        uint8_t castling_us_oo;                      8273
+        uint8_t castling_them_ooo;                   8274
+        uint8_t castling_them_oo;                    8275
+        uint8_t side_to_move_or_enpassant;           8276
+        uint8_t rule50_count;                        8277
+        // Bitfield with the following allocation:
+        //  bit 7: side to move (input type 3)
+        //  bit 6: position marked for deletion by the rescorer (never set by lc0)
+        //  bit 5: game adjudicated (v6)
+        //  bit 4: max game length exceeded (v6)
+        //  bit 3: best_q is for proven best move (v6)
+        //  bit 2: transpose transform (input type 3)
+        //  bit 1: mirror transform (input type 3)
+        //  bit 0: flip transform (input type 3)
+        uint8_t invariance_info;                     8278
+        uint8_t dep_result;                               8279
+        float root_q;                                8280
+        float best_q;                                8284
+        float root_d;                                8288
+        float best_d;                                8292
+        float root_m;      // In plies.              8296
+        float best_m;      // In plies.              8300
+        float plies_left;                            8304
+        float result_q;                              8308
+        float result_d;                              8312
+        float played_q;                              8316
+        float played_d;                              8320
+        float played_m;                              8324
+        // The folowing may be NaN if not found in cache.
+        float orig_q;      // For value repair.      8328
+        float orig_d;                                8332
+        float orig_m;                                8336
+        uint32_t visits;                             8340
+        // Indices in the probabilities array.
+        uint16_t played_idx;                         8344
+        uint16_t best_idx;                           8346
+        float pol_kld;                               8348
+        float st_q;                                  8352
+        float st_d;                                  8356
+        uint64_t planes[96];        768 bytes        8360
+        uint32_t chunk_size                          9128
+        ___                                          9132
+
+
+        """
+        # unpack the V6 content from raw byte array, arbitrarily chose 4 2-byte values
+        # for the 8 "reserved" bytes
+        (ver, input_format, probs, planes, us_ooo, us_oo, them_ooo, them_oo,
+         stm, rule50_count, invariance_info, dep_result, root_q, best_q,
+         root_d, best_d, root_m, best_m, plies_left, result_q, result_d,
+         played_q, played_d, played_m, orig_q, orig_d, orig_m, visits,
+         played_idx, best_idx, pol_kld, st_q, st_d, fut_planes) = self.v7_struct.unpack(content)
+        """
+        v5 struct format was (8308 bytes total)
+            int32 version (4 bytes)
+            int32 input_format (4 bytes)
+            1858 float32 probabilities (7432 bytes)
+            104 (13*8) packed bit planes of 8 bytes each (832 bytes)
+            uint8 castling us_ooo (1 byte)
+            uint8 castling us_oo (1 byte)
+            uint8 castling them_ooo (1 byte)
+            uint8 castling them_oo (1 byte)
+            uint8 side_to_move (1 byte)
+            uint8 rule50_count (1 byte)
+            uint8 dep_ply_count (1 byte) (unused)
+            int8 result (1 byte)
+            float32 root_q (4 bytes)
+            float32 best_q (4 bytes)
+            float32 root_d (4 bytes)
+            float32 best_d (4 bytes)
+            float32 root_m (4 bytes)
+            float32 best_m (4 bytes)
+            float32 plies_left (4 bytes)
+        """
+        # v3/4 data sometimes has a useful value in dep_ply_count (now invariance_info),
+        # so copy that over if the new ply_count is not populated.
+        if plies_left == 0:
+            plies_left = invariance_info
+        plies_left = struct.pack("f", plies_left)
+
+        assert input_format == self.expected_input_format
+
+        # Unpack bit planes and cast to 32 bit float
+        planes = np.unpackbits(np.frombuffer(planes, dtype=np.uint8)).astype(
+            np.float32)
+        
+        fut_planes = np.unpackbits(np.frombuffer(fut_planes, dtype=np.uint8)).astype(
+            np.float32)
+
+        rule50_divisor = 99.0
+        if input_format > 3:
+            rule50_divisor = 100.0
+        rule50_plane = struct.pack("f", rule50_count / rule50_divisor) * 64
+
+        if input_format == 1:
+            middle_planes = self.flat_planes[us_ooo] + \
+                self.flat_planes[us_oo] + \
+                self.flat_planes[them_ooo] + \
+                self.flat_planes[them_oo] + \
+                self.flat_planes[stm]
+        elif input_format == 2:
+            # Each inner array has to be reversed as these fields are in opposite endian to the planes data.
+            them_ooo_bytes = reverse_expand_bits(them_ooo)
+            us_ooo_bytes = reverse_expand_bits(us_ooo)
+            them_oo_bytes = reverse_expand_bits(them_oo)
+            us_oo_bytes = reverse_expand_bits(us_oo)
+            middle_planes = us_ooo_bytes + (6*8*4) * b"\x00" + them_ooo_bytes + \
+                us_oo_bytes + (6*8*4) * b"\x00" + them_oo_bytes + \
+                self.flat_planes[0] + \
+                self.flat_planes[0] + \
+                self.flat_planes[stm]
+        elif input_format == 3 or input_format == 4 or input_format == 132 or input_format == 5 or input_format == 133:
+            # Each inner array has to be reversed as these fields are in opposite endian to the planes data.
+            them_ooo_bytes = reverse_expand_bits(them_ooo)
+            us_ooo_bytes = reverse_expand_bits(us_ooo)
+            them_oo_bytes = reverse_expand_bits(them_oo)
+            us_oo_bytes = reverse_expand_bits(us_oo)
+            enpassant_bytes = reverse_expand_bits(stm)
+            middle_planes = us_ooo_bytes + (6*8*4) * b"\x00" + them_ooo_bytes + \
+                us_oo_bytes + (6*8*4) * b"\x00" + them_oo_bytes + \
+                self.flat_planes[0] + \
+                self.flat_planes[0] + \
+                (7*8*4) * b"\x00" + enpassant_bytes
+
+        # Concatenate all byteplanes. Make the last plane all 1"s so the NN can
+        # detect edges of the board more easily
+        aux_plus_6_plane = self.flat_planes[0]
+        if (input_format == 132
+                or input_format == 133) and invariance_info >= 128:
+            aux_plus_6_plane = self.flat_planes[1]
+        planes = planes.tobytes() + \
+            middle_planes + \
+            rule50_plane + \
+            aux_plus_6_plane + \
+            self.flat_planes[1]
+
+        assert len(planes) == ((8 * 13 * 1 + 8 * 1 * 1) * 8 * 8 * 4)
+
+        if ver == V6_VERSION:
+            winner = struct.pack("fff", 0.5 * (1.0 - result_d + result_q),
+                                 result_d, 0.5 * (1.0 - result_d - result_q))
+        else:
+            dep_result = float(dep_result)
+            assert dep_result == 1.0 or dep_result == -1.0 or dep_result == 0.0
+            winner = struct.pack("fff", dep_result == 1.0, dep_result == 0.0,
+                                 dep_result == -1.0)
+        
+
+        def wdl_from_qd(q, d):
+            w = 0.5 * (1.0 - d + q)
+            l = 0.5 * (1.0 - d - q)
+            assert -1.0 <= q <= 1.0 and 0.0 <= d <= 1.0
+            return struct.pack("fff", q, d, l)
+
+        best_q = wdl_from_qd(best_q, best_d)
+        st_q = wdl_from_qd(st_q, st_d)
+
+        played_idx = struct.pack("i", played_idx)
+
+
+        return (planes, probs, winner, best_q, plies_left, st_q, fut_planes)
+
+
     def sample_record(self, chunkdata):
         """
         Randomly sample through the v3/4/5/6 chunk data and select records in v6 format
@@ -418,6 +611,8 @@ class ChunkParserInner:
         diff focus may also skip some records.
         """
         version = chunkdata[0:4]
+        if version == V7_VERSION:
+            record_size = self.v7_struct.size
         if version == V6_VERSION:
             record_size = self.v6_struct.size
         elif version == V5_VERSION:
@@ -475,7 +670,9 @@ class ChunkParserInner:
                 chunk_file.seek(0)
                 if version == b'':
                     return
-                if version == V6_VERSION:
+                if version == V7_VERSION:
+                    record_size = self.v6_struct.size
+                elif version == V6_VERSION:
                     record_size = self.v6_struct.size
                 elif version == V5_VERSION:
                     record_size = self.v5_struct.size
@@ -697,17 +894,39 @@ def apply_alpha(qs, alpha):
 
     return q_st
 
-def rescore_file(filename, st_alpha=1-1/6, lt_alpha=1-1/24):
-    v6_struct = struct.Struct(V6_STRUCT_STRING)
-    record_size = v6_struct.size
+def expand_file(filename, new_size):
+    cd_array = bytes()
+    with gzip.open(filename, "rb") as chunk_file:
+        record_size = v6_struct.size
+        chunk_file.seek(0)
+        chunkdata = chunk_file.read()
+        print(len(chunkdata))
+        assert len(chunkdata) % record_size == 0
+        if len(chunkdata) == 0:
+            return
+        n_chunks = len(chunkdata) // record_size
+
+        for i in range(n_chunks):
+            version = chunkdata[i * record_size: i * record_size + 4]
+            assert version == V6_VERSION, f"version should be 6, got {struct.unpack('i', version)[0]}"
+            cd_array += chunkdata[i*record_size:(i+1)*record_size] + b"\x00" * (new_size - record_size)
+
+    assert len(cd_array) % new_size == 0 # sanity check
+
+    with gzip.open(filename, 'wb') as chunk_file:
+        chunk_file.write(cd_array)
+
+def rescore_file(filename, st_alpha=1-1/6):
+    record_size = v7_struct.size
     # C:/leeladata/train/training-run2-test77-20211214-1618/*.gz
     # apply ema with alpha
     cd_array = bytearray()
+    n_future = 8
 
-    try:
-        with gzip.open(filename, "rb") as chunk_file:
+    with gzip.open(filename, "rb") as chunk_file:
             chunk_file.seek(0)
             chunkdata = chunk_file.read()
+            assert len(chunkdata) % record_size == 0
             if len(chunkdata) == 0:
                 return
             version = chunkdata[0:4]
@@ -717,23 +936,46 @@ def rescore_file(filename, st_alpha=1-1/6, lt_alpha=1-1/24):
 
             # Gather q bytes
             qs = []
+            ds = []
+            white_boards = b""
+            black_boards = b""
             for i in range(n_chunks):
-                qs.append(struct.unpack("f", chunkdata[i*record_size+8280:i*record_size+8284])[0])
-
+                start = i*record_size
+                print(f"Version { struct.unpack('i', chunkdata[start: start+4])}")
+                qs.append(struct.unpack("f", chunkdata[start+8280:start + 8280 + 4])[0])
+                ds.append(struct.unpack("f", chunkdata[start+8288:start + 8288 + 4])[0])
+                plane = chunkdata[7440:7440 + 8 * 12]
+                if i % 2 == 0: # this board is from white's perspective
+                    white_boards += plane
+                    black_boards += reverse_board(plane)
+                else:
+                    white_boards += reverse_board(plane)
+                    black_boards += plane
+            white_boards += white_boards[-8*12:] * n_future # history is the final position if game over
+            black_boards += black_boards[-8*12:] * n_future
+            
             q_st = apply_alpha(qs, st_alpha)
+            d_st = apply_alpha(ds, st_alpha)
 
             cd_array = bytearray(chunkdata)
             for i in range(n_chunks):
+                start = i*record_size
                 if abs(q_st[i]) > 1 + 1e-6:
                     print(f"Got {q_st[i]}")
                 # root q 
-                cd_array[i*record_size + 8352:i*record_size + 8356] = struct.pack("f", q_st[i])
+                cd_array[start: start + 4] = V7_STRUCT_STRING
+                cd_array[start + 8352:start + 8352 + 4] = struct.pack("f", q_st[i])
+                cd_array[start + 8356:start + 8356 + 4] = struct.pack("f", d_st[i])
+
+                boards = white_boards if i % 2 == 0 else black_boards
+                cd_array[start + 8360: start + 8360 + 8 * 12 * n_future] = boards[(8 * 12) * i: (8*12) * (i + n_future)]
             
-    except Exception as e:
-        print(f"Could not read {filename}, got {e}")
+                cd_array[start + 9128 : 9128 + 4] = struct.pack("i", record_size)
+
     
-    with gzip.open(filename, 'wb') as chunk_file:
-        chunk_file.write(bytes(cd_array))
+    if cd_array:
+        with gzip.open(filename, 'wb') as chunk_file:
+            chunk_file.write(bytes(cd_array))
 
 def rescore_files(filenames, progress, task_id, **kwargs):
     i = 0
@@ -743,10 +985,16 @@ def rescore_files(filenames, progress, task_id, **kwargs):
         progress[task_id] = {"progress": i + 1, "total": len(filenames)}
 
 def rescore_files_normal(filenames, **kwargs):
-    n_chunks = 0
     i = 0
     for filename in filenames:
         rescore_file(filename, **kwargs)
+        i += 1
+        print(f"Processed {i} of {len(filenames)} chunks")
+
+def expand_files_normal(filenames, **kwargs):
+    i = 0
+    for filename in filenames:
+        expand_file(filename, **kwargs)
         i += 1
         print(f"Processed {i} of {len(filenames)} chunks")
 

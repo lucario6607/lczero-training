@@ -328,6 +328,12 @@ class Net:
             d = {'kernel': 'ip{}_val_w', 'bias': 'ip{}_val_b'}
 
             return d[w].format(n)
+    
+        def future_to_bp(w):
+            w = w.split(':')[0] 
+            d = {'kernel': 'ip_fut_w', 'bias': 'ip_fut_b'}
+
+            return d[w]
 
 
         def conv_policy_to_bp(w):
@@ -456,6 +462,12 @@ class Net:
             if 'dense' in layers[2] or 'embedding' in layers[2]:
                 pb_name = value_to_bp(layers[2], weights_name)
             pb_name = pb_prefix + pb_name
+
+
+        elif base_layer == 'future':
+            pb_name = 'future_head.' + future_to_bp(weights_name)
+            
+
         elif base_layer == 'moves_left':
             if 'dense' in layers[1] or 'embedding' in layers[1]:
                 pb_name = moves_left_to_bp(layers[1], weights_name)

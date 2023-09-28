@@ -137,6 +137,13 @@ message Weights {
     optional Layer ip_val_err_b = 8;
   }
 
+  message FutureHead {
+    // Future head
+
+    optional Layer ip_fut_w = 1;  // "embedding" for future head
+    optional Layer ip_fut_b = 2; // "embedding" for future head
+  }
+
   
   message PolicyHeads {
     optional Layer ip_pol_w = 1;    // "embedding" in policy attention
@@ -215,6 +222,7 @@ message Weights {
 
   optional ValueHeads value_heads = 44;
   optional PolicyHeads policy_heads = 45;
+  optional FutureHead future_head = 46;
 
   // Moves left head
   optional ConvBlock moves_left = 12;
