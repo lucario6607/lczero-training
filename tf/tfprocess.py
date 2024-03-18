@@ -391,6 +391,10 @@ class TFProcess:
         self.categorical_value_buckets = self.cfg["model"].get(
             "categorical_value_buckets", 0)
 
+        self.moe_experts = self.cfg["model"].get("moe_experts", 16)
+        self.use_moe = self.cfg["model"].get("use_moe", False)
+        self.moe_capacity_factor = self.cfg["model"].get("moe_capacity_factor", 2)
+
 
         self.encoder_dff = self.cfg["model"].get(
             "encoder_dff", (self.embedding_size*1.5)//1)
@@ -730,13 +734,17 @@ class TFProcess:
             self.optimizer = tf.keras.mixed_precision.LossScaleOptimizer(
                 self.optimizer, dynamic=True)
 
-        def split_value_buckets(x, n_buckets=None, lo=-1, hi=1):
+        def split_value_buckets(x, n_buckets=None, lo=-1, hi=1, smoothing=0.001):
             if n_buckets is None:
                 n_buckets = self.categorical_value_buckets
             x = tf.clip_by_value(x, lo, hi - 1e-9)
             x = (x - lo) / (hi - lo) * n_buckets
             x = tf.cast(x, tf.int32)
-            return tf.one_hot(x, n_buckets, dtype=tf.float32)
+            out = tf.one_hot(x, n_buckets, dtype=tf.float32)
+            out = out + smoothing / n_buckets
+            out = out / tf.reduce_sum(out, axis=-1, keepdims=True)
+
+            return out
 
         def categorical_value_loss(target, output):
             target = convert_val_to_scalar(target, softmax=False)
@@ -2066,7 +2074,48 @@ class TFProcess:
 
         return out, activations
 
-    def encoder_layer(self, inputs, emb_size: int, d_model: int, num_heads: int, dff: int, name: str, training: bool):
+
+    def experts_choose_moe(self, inputs, emb_size: int, dff: int, initializer, name: str, num_experts=None):
+        import tensorflow_models as tfm
+        if num_experts is None:
+            num_experts = self.moe_experts
+        if isinstance(self.ffn_activation, str):
+            activation = tf.keras.activations.get(self.ffn_activation)
+        else:
+            activation = self.ffn_activation
+        router = tfm.nlp.layers.ExpertsChooseMaskedRouter(
+            num_experts,
+            jitter_noise = 0.0,
+            router_z_loss_weight = 0.0,
+            export_metrics = True,
+            name=name+"/router",
+            )
+
+        experts = tfm.nlp.layers.FeedForwardExperts(
+            num_experts,
+            dff,
+            kernel_initializer=initializer,
+            activation=activation,
+            name=name+"/experts",
+        )
+
+        moe_layer = tfm.nlp.layers.MoeLayer(
+            experts,
+            router,
+            train_capacity_factor=self.moe_capacity_factor,
+            eval_capacity_factor=self.moe_capacity_factor,
+            # examples_per_group: float = 1.0,
+            name=name+"/moe"
+        )
+
+        return moe_layer(inputs)
+
+
+
+        
+
+
+    def encoder_layer(self, inputs, emb_size: int, d_model: int, num_heads: int, dff: int, name: str, training: bool, use_moe=False):
         # DeepNorm
         alpha = tf.cast(tf.math.pow(
             2. * self.encoder_layers, -0.25), self.model_dtype)
@@ -2095,8 +2144,15 @@ class TFProcess:
         activations[name + "/ln1"] = out1
 
         # feed-forward network
-        ffn_output, activations_ffn = self.ffn(out1, emb_size, dff,
-                              xavier_norm, name=name + "/ffn", glu=self.glu)
+        if use_moe:
+            ffn_output = self.experts_choose_moe(out1, emb_size, dff,
+                              xavier_norm, name=name + "/ffn")
+            activations_ffn = {}
+        else:
+            ffn_output, activations_ffn = self.ffn(out1, emb_size, dff,
+                                xavier_norm, name=name + "/ffn", glu=self.glu)
+        
+
         ffn_output = tf.keras.layers.Dropout(
             self.dropout_rate, name=name + "/dropout2")(ffn_output, training=training)
         
@@ -2211,7 +2267,7 @@ class TFProcess:
         for i in range(self.encoder_layers):
             flow, attn_wts_l, activations_l = self.encoder_layer(flow, self.embedding_size, self.encoder_d_model,
                                                   self.encoder_heads, self.encoder_dff,
-                                                  name=name+"encoder_{}".format(i + 1), training=True)
+                                                  name=name+"encoder_{}".format(i + 1), training=True, use_moe=self.use_moe and i%2==0)
 
             attn_wts.append(attn_wts_l)
             activations.update(activations_l)
@@ -2356,12 +2412,15 @@ class TFProcess:
 
             return value, value_err, value_cat
 
+        use_cat = self.cfg['model'].get('categorical_value', True)
+        use_err = self.cfg['model'].get('value_error', True)
+
         value_winner, value_winner_err, value_winner_cat = value_head(
-            name="value/winner", wdl=self.wdl, use_err=False)
+            name="value/winner", wdl=self.wdl, use_err=False, use_cat=False)
         value_q, value_q_err, value_q_cat = value_head(
-            name="value/q", wdl=self.wdl, use_err=True) if self.cfg['model'].get('value_q', False) else (None, None, None)
+            name="value/q", wdl=self.wdl, use_err=use_err, use_cat=use_cat) if self.cfg['model'].get('value_q', False) else (None, None, None)
         value_st, value_st_err, value_st_cat = value_head(
-            name="value/st", wdl=self.wdl, use_err=True) if self.cfg['model'].get('value_st', False) else (None, None, None)
+            name="value/st", wdl=self.wdl, use_err=use_err, use_cat=use_cat) if self.cfg['model'].get('value_st', False) else (None, None, None)
 
         # Moves left head
         if self.moves_left:
@@ -2421,7 +2480,7 @@ class TFProcess:
             try:
                 outputs[key] = tf.cast(outputs[key], tf.float32)
             except:
-                assert key == "attn_wts"
+                assert key in ["attn_wts", "activations"]
                 # don't want to cast since the memory will jump
                 # out = []
                 # for t in outputs[key]:
