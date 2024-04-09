@@ -356,7 +356,7 @@ class Metric:
 
 
 class TFProcess:
-    def __init__(self, cfg):
+    def __init__(self, cfg, is_teacher=False):
         self.cfg = cfg
         self.net = Net()
         self.root_dir = os.path.join(self.cfg["training"]["path"],
@@ -365,6 +365,8 @@ class TFProcess:
         # Thresholds for policy_threshold_accuracy
         self.accuracy_thresholds = self.cfg["training"].get(
             "accuracy_thresholds", [1, 2, 5, 10])
+        
+        self.teacher = None
 
         # Sparse training
         self.sparse = self.cfg["training"].get("sparse", False)
@@ -597,30 +599,31 @@ class TFProcess:
         self.renorm_max_d = self.cfg["training"].get("renorm_max_d", 0)
         self.renorm_momentum = self.cfg["training"].get(
             "renorm_momentum", 0.99)
-
-        if self.cfg['gpu'] == 'all':
-            gpus = tf.config.experimental.list_physical_devices('GPU')
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            self.strategy = tf.distribute.MirroredStrategy()
-            tf.distribute.experimental_set_strategy(self.strategy)
-        elif "," in str(self.cfg['gpu']):
-            active_gpus = []
-            gpus = tf.config.experimental.list_physical_devices('GPU')
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            for i in self.cfg['gpu'].split(","):
-                active_gpus.append("GPU:" + i)
-            self.strategy = tf.distribute.MirroredStrategy(active_gpus)
-            tf.distribute.experimental_set_strategy(self.strategy)
-        else:
-            gpus = tf.config.experimental.list_physical_devices('GPU')
-            print(gpus)
-            tf.config.experimental.set_visible_devices(gpus[self.cfg['gpu']],
-                                                       'GPU')
-            tf.config.experimental.set_memory_growth(gpus[self.cfg['gpu']],
-                                                     True)
-            self.strategy = None
+        
+        if not is_teacher:
+            if self.cfg['gpu'] == 'all':
+                gpus = tf.config.experimental.list_physical_devices('GPU')
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                self.strategy = tf.distribute.MirroredStrategy()
+                tf.distribute.experimental_set_strategy(self.strategy)
+            elif "," in str(self.cfg['gpu']):
+                active_gpus = []
+                gpus = tf.config.experimental.list_physical_devices('GPU')
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                for i in self.cfg['gpu'].split(","):
+                    active_gpus.append("GPU:" + i)
+                self.strategy = tf.distribute.MirroredStrategy(active_gpus)
+                tf.distribute.experimental_set_strategy(self.strategy)
+            else:
+                gpus = tf.config.experimental.list_physical_devices('GPU')
+                print(gpus)
+                tf.config.experimental.set_visible_devices(gpus[self.cfg['gpu']],
+                                                        'GPU')
+                tf.config.experimental.set_memory_growth(gpus[self.cfg['gpu']],
+                                                        True)
+                self.strategy = None
         if self.model_dtype == tf.float16:
             tf.keras.mixed_precision.set_global_policy('mixed_float16')
         if self.model_dtype == tf.bfloat16:
@@ -656,7 +659,10 @@ class TFProcess:
         else:
             self.init_net()
 
-    def init_net(self):
+    def set_teacher(self, teacher):
+        self.teacher = teacher
+
+    def init_net(self, is_teacher=False):
         input_var = tf.keras.Input(shape=(112, 8, 8))
         outputs = self.construct_net(input_var)
         self.model = tf.keras.Model(inputs=input_var, outputs=outputs)
@@ -1058,25 +1064,26 @@ class TFProcess:
         self.cfg["training"]["lr_boundaries"].sort()
         self.warmup_steps = self.cfg["training"].get("warmup_steps", 0)
         self.lr = self.cfg["training"]["lr_values"][0]
-        self.test_writer = tf.summary.create_file_writer(
-            os.path.join(os.getcwd(),
-                         "leelalogs/{}-test".format(self.cfg["name"])))
-        self.train_writer = tf.summary.create_file_writer(
-            os.path.join(os.getcwd(),
-                         "leelalogs/{}-train".format(self.cfg["name"])))
-        if vars(self).get("validation_dataset", None) is not None:
-            self.validation_writer = tf.summary.create_file_writer(
-                os.path.join(
-                    os.getcwd(),
-                    "leelalogs/{}-validation".format(self.cfg["name"])))
-        if self.swa_enabled:
-            self.swa_writer = tf.summary.create_file_writer(
+        if not is_teacher:
+            self.test_writer = tf.summary.create_file_writer(
                 os.path.join(os.getcwd(),
-                             "leelalogs/{}-swa-test".format(self.cfg["name"])))
-            self.swa_validation_writer = tf.summary.create_file_writer(
-                os.path.join(
-                    os.getcwd(),
-                    "leelalogs/{}-swa-validation".format(self.cfg["name"])))
+                            "leelalogs/{}-test".format(self.cfg["name"])))
+            self.train_writer = tf.summary.create_file_writer(
+                os.path.join(os.getcwd(),
+                            "leelalogs/{}-train".format(self.cfg["name"])))
+            if vars(self).get("validation_dataset", None) is not None:
+                self.validation_writer = tf.summary.create_file_writer(
+                    os.path.join(
+                        os.getcwd(),
+                        "leelalogs/{}-validation".format(self.cfg["name"])))
+            if self.swa_enabled:
+                self.swa_writer = tf.summary.create_file_writer(
+                    os.path.join(os.getcwd(),
+                                "leelalogs/{}-swa-test".format(self.cfg["name"])))
+                self.swa_validation_writer = tf.summary.create_file_writer(
+                    os.path.join(
+                        os.getcwd(),
+                        "leelalogs/{}-swa-validation".format(self.cfg["name"])))
         self.checkpoint = tf.train.Checkpoint(optimizer=self.orig_optimizer,
                                               model=self.model,
                                               global_step=self.global_step,
@@ -1248,6 +1255,19 @@ class TFProcess:
 
     @tf.function()
     def process_inner_loop(self, x, y, z, q, m, st_q, opp_idx, next_idx):
+        if self.teacher:
+            teacher_outputs = self.teacher.model(x, training=False)
+            teacher_policy = teacher_outputs.get("policy")
+            teacher_policy_opt_st = teacher_outputs.get("policy_optimistic_st")
+            teacher_policy_soft = teacher_outputs.get("policy_soft")
+            z = tf.nn.softmax(teacher_outputs.get("value_winner"))
+            m = teacher_outputs.get("moves_left")
+            st_q = tf.nn.softmax(teacher_outputs.get("value_st"))
+            q = tf.nn.softmax(teacher_outputs.get("value_q"))
+        else:
+            teacher_policy=None
+            teacher_policy_opt_st=None
+            teacher_policy_soft=None
 
         with tf.GradientTape() as tape:
 
@@ -1270,6 +1290,18 @@ class TFProcess:
             policy_optimistic_st = self.correct_policy_fn(y, policy_optimistic_st)
             policy_van_opt = self.correct_policy_fn(y, policy_van_opt)
             policy_soft = self.correct_policy_fn(y, policy_soft)
+
+            teacher_policy = self.correct_policy_fn(y, teacher_policy)
+            teacher_policy_opt_st = self.correct_policy_fn(y, teacher_policy_opt_st)
+            teacher_policy_soft = self.correct_policy_fn(y, teacher_policy_soft)
+
+
+            if teacher_policy is not None:
+                teacher_policy = tf.nn.softmax(teacher_policy)
+            if teacher_policy_opt_st is not None:
+                teacher_policy_opt_st = tf.nn.softmax(teacher_policy_opt_st)
+            if teacher_policy_soft is not None:
+                teacher_policy_soft = tf.nn.softmax(teacher_policy_soft)
             
             # Remove mask on target
             y = tf.nn.relu(y)
@@ -1281,10 +1313,15 @@ class TFProcess:
             policy_thresholded_accuracies = self.policy_thresholded_accuracy_fn(
                 y, policy)
             if policy_optimistic_st is not None:
-                optimism_weights = self.policy_optimism_weights_fn(
-                    st_q, value_st, value_st_err)
-                policy_optimistic_st_loss = self.policy_loss_fn(
-                    y, policy_optimistic_st, weights=optimism_weights)
+                if self.teacher:
+                    policy_optimistic_st_loss = self.policy_loss_fn(
+                        teacher_policy_opt_st, policy_optimistic_st)
+
+                else:
+                    optimism_weights = self.policy_optimism_weights_fn(
+                        st_q, value_st, value_st_err)
+                    policy_optimistic_st_loss = self.policy_loss_fn(
+                        y, policy_optimistic_st, weights=optimism_weights)
                 policy_optimistic_st_divergence = self.policy_divergence_fn(
                     policy, policy_optimistic_st)
             else:
@@ -1304,8 +1341,16 @@ class TFProcess:
                 
 
             if policy_soft is not None:
-                policy_soft_loss = self.policy_loss_fn(
-                    y, policy_soft, temperature=self.soft_policy_temperature)
+
+                if self.teacher:
+
+                    policy_soft_loss = self.policy_loss_fn(
+                        teacher_policy_soft, policy_soft)
+                    
+                else:
+                    policy_soft_loss = self.policy_loss_fn(
+                        y, policy_soft, temperature=self.soft_policy_temperature)
+                    
             else:
                 policy_soft_loss = tf.constant(0.)
 
