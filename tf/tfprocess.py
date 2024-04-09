@@ -1307,7 +1307,7 @@ class TFProcess:
             y = tf.nn.relu(y)
 
             # Policy losses
-            policy_loss = self.policy_loss_fn(y, policy)
+            policy_loss = self.policy_loss_fn(teacher_policy if teacher_policy is not None else y, policy)
             policy_accuracy = self.policy_accuracy_fn(y, policy)
             policy_entropy = self.policy_entropy_fn(policy)
             policy_thresholded_accuracies = self.policy_thresholded_accuracy_fn(
