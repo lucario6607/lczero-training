@@ -339,7 +339,7 @@ class Net:
                         'Unable to decode policy weight {}/{}'.format(layers[2],
                                                                      weights_name))
                 
-            elif layers[1] in ['vanilla', 'soft', 'optimistic_st', 'opponent', 'next']:
+            elif layers[1] in ['vanilla', 'soft', 'optimistic_st', 'opponent', 'next', 'van_opt']:
                 pb_prefix = pb_prefix + layers[1] + '.'
                 if layers[2] == 'attention':
                     pb_name = attn_pol_to_bp(layers[3], weights_name)
