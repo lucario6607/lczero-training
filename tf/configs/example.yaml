@@ -100,7 +100,7 @@ model:
     moves_left: 'v1'
     input_type: 'classic'
 
-    # Smolgen
+    # Smolgen (obsolete, use rpe instead)
     use_smolgen: false
     smolgen_hidden_channels: 16
     smolgen_hidden_sz: 64
@@ -112,12 +112,18 @@ model:
     use_rpe_k: true
     use_rpe_v: true
 
-    # Gating
+    # Gating (for ablations only, use rpe instead)
     use_logit_gating: false
 
-    # Ablations
+    # Speedups
     omit_qkv_biases: true # these two increases training speed by ~10% on BT4 
     encoder_rms_norm: true # without quality degradation
+
+    # DWA
+    use_dwa: false
+    dwa_channelwise: false
+    dwa_period: 1
+    dwa_dilation: 1 # this setting is ignored for now
 
     # Output heads
     policy_optimistic_st: false
@@ -129,7 +135,7 @@ model:
     categorical_value_buckets: 32
     soft_policy_temperature: 4.0
 
-    # quantization
+    # Quantization
     quantize_activations: false
     quantize_weights: false
     quantize_activation_bits: 8

@@ -213,7 +213,6 @@ class Gating(tf.keras.layers.Layer):
             inputs, self.gate)
 
 
-
 def ma_gating(inputs, name):
     out = Gating(name=name + '/mult_gate', additive=False)(inputs)
     out = Gating(name=name + '/add_gate', additive=True)(out)
@@ -315,8 +314,43 @@ class RPEValue(tf.keras.layers.Layer):
         out = tf.einsum('bhqk, dhqk->bhqd', wts, rpe_value)
         return out
 
+class DWAInitilizer(tf.keras.initializers.Initializer):
+    def __init__(self, **kwargs):
+        super(DWAInitilizer, self).__init__(**kwargs)
+    
+    def __call__(self, shape, dtype=None):
+        # shape is (n,) or (n, channels)
+        n = shape[0]
+        out = tf.concat([tf.zeros([n-1]), tf.ones([1])], axis=0)
+        if len(shape) == 2:
+            out = tf.expand_dims(out, 1)
+            out = tf.tile(out, [1, shape[1]])
+        return out
 
-
+class DWA(tf.keras.layers.Layer):
+    """
+    Following the Denseformer paper, the input to transformer layers is a DWA of previous layer outputs
+    
+    """
+    def __init__(self, channelwise=False, **kwargs):
+        super(DWA, self).__init__(**kwargs)
+        self.channelwise = channelwise
+    
+    def build(self, input_shape):
+        # ipnut shape is a list of tensors representing the shape
+        self.n_inputs = len(input_shape)
+        self.n_channels = input_shape[0][-1]
+        # we initialize our dwa so that the coefficient for the last layer is 1
+        # and the other layers are all 0
+        shape = [self.n_inputs, self.n_channels] if self.channelwise else [self.n_inputs]
+        self.dwa = self.add_weight(name="dwa", shape=shape, initializer=DWAInitilizer(), trainable=True)
+    
+    def call(self, inputs):
+        # inputs is a list of tensors
+        out = tf.zeros_like(inputs[0])
+        for i in range(self.n_inputs):
+            out += inputs[i] * self.dwa[i]
+        return out
 
 
 
@@ -427,6 +461,11 @@ class TFProcess:
         self.use_rpe_v = self.cfg["model"].get("use_rpe_v", False)
         
         self.use_extra_lns = self.cfg["model"].get("use_extra_lns", False)
+
+        self.use_dwa = self.cfg["model"].get("use_dwa", False)
+        self.dwa_channelwise = self.cfg["model"].get("dwa_channelwise", False)
+        self.dwa_period = self.cfg["model"].get("dwa_period", 1)
+        self.dwa_dilaton = self.cfg["model"].get("dwa_dilaton", 1)
 
 
         self.use_logit_gating = self.cfg["model"].get("use_logit_gating", False)
@@ -661,20 +700,16 @@ class TFProcess:
         outputs = self.construct_net(input_var)
         self.model = tf.keras.Model(inputs=input_var, outputs=outputs)
 
-
-
-
-
-
-
         print(f"params: {self.model.count_params()}")
         smolgen_params = np.sum([K.count_params(w) for w in self.model.trainable_weights if "smol" in w.name])
+        rpe_params = np.sum([K.count_params(w) for w in self.model.trainable_weights if "rpe" in w.name])
         emb_params = np.sum([K.count_params(w) for w in self.model.trainable_weights if "embedding/preprocess" in w.name])
 
 
         print(f"smolgen params: {smolgen_params}")
-        print(f"emb preproc params: {emb_params}")
+        print(f"rpe params: {rpe_params}")
 
+        print(f"emb preproc params: {emb_params}")
 
 
         try:
@@ -2254,13 +2289,28 @@ class TFProcess:
 
         attn_wts = []
         activations = {}
+        hidden_states = [flow]
         for i in range(self.encoder_layers):
+            # TODO: support period
+            use_dwa = self.use_dwa
+
+            if use_dwa:
+                # the list of hidden states to consists of the last hidden state and every
+                # xth hidden state prior, where x is the period
+                period = self.dwa_period
+                channelwise = self.dwa_channelwise
+                this_hidden_states = hidden_states[i % period::period]
+                if len(this_hidden_states) >= 2:
+                    flow = DWA(name=name+"dwa_{}".format(i), channelwise=channelwise)(this_hidden_states)
+
+
             flow, attn_wts_l, activations_l = self.encoder_layer(flow, self.embedding_size, self.encoder_d_model,
                                                   self.encoder_heads, self.encoder_dff,
                                                   name=name+"encoder_{}".format(i + 1), training=True, use_moe=self.use_moe and i%2==0)
 
             attn_wts.append(attn_wts_l)
             activations.update(activations_l)
+            hidden_states.append(flow)
 
 
         flow_ = flow
