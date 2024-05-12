@@ -121,6 +121,7 @@ message Weights {
     optional FFN ffn = 4;
     optional Layer ln2_gammas = 5;
     optional Layer ln2_betas = 6;
+    optional Layer dwa = 7;
   }
 
   message PolicyHead {

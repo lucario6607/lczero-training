@@ -2301,7 +2301,8 @@ class TFProcess:
                 channelwise = self.dwa_channelwise
                 this_hidden_states = hidden_states[i % period::period]
                 if len(this_hidden_states) >= 2:
-                    flow = DWA(name=name+"dwa_{}".format(i), channelwise=channelwise)(this_hidden_states)
+                    flow = DWA(name=name+"encoder_{}".format(i + 1) + "/dwa", channelwise=channelwise)(this_hidden_states)
+
 
 
             flow, attn_wts_l, activations_l = self.encoder_layer(flow, self.embedding_size, self.encoder_d_model,

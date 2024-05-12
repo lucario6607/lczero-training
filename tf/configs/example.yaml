@@ -34,7 +34,7 @@ training:
     renorm_max_r: 1.0
     renorm_max_d: 0.0
     test_steps: 1_000
-    disable_pb_checkpointing: true
+    disable_pb_checkpointing: false
     # validation_steps: 5000
     num_test_positions: 131_072
     train_avg_report_steps: 1_000
@@ -120,7 +120,7 @@ model:
     encoder_rms_norm: true # without quality degradation
 
     # DWA
-    use_dwa: false
+    use_dwa: true
     dwa_channelwise: false
     dwa_period: 1
     dwa_dilation: 1 # this setting is ignored for now

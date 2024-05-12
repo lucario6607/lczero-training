@@ -376,6 +376,8 @@ class Net:
                     pb_name = 'mha.' + mha_to_bp(layers[2], weights_name)
             elif layers[1] == 'ffn':
                 pb_name = 'ffn.' + ffn_to_bp(layers[2], weights_name)
+            elif layers[1] == 'dwa':
+                pb_name = 'dwa'
             else:
                 pb_name = encoder_to_bp(layers[1], weights_name)
         elif base_layer == 'embedding':
