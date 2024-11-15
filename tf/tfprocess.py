@@ -401,6 +401,8 @@ class TFProcess:
         self.rep_quant = self.cfg["model"].get("rep_quant", False)
 
 
+        self.parallel_layers = self.cfg["model"].get("parallel_layers", False)
+        self.nla = self.cfg["model"].get("nla", False)
 
 
         # Network structure
@@ -2021,6 +2023,8 @@ class TFProcess:
 
         activations = {}
 
+        if self.nla:
+            inputs = DenseLayer(depth, name=name+"/nla", kernel_initializer="glorot_normal", use_bias=True, activation=self.DEFAULT_ACTIVATION)(inputs)
 
         if self.use_absolute_pe:
             inputs = Gating(name=name+"/abs_pe")(inputs)
@@ -2138,22 +2142,36 @@ class TFProcess:
         attn_output = tf.keras.layers.Dropout(
             self.dropout_rate, name=name + "/dropout1")(attn_output, training=training)
 
-        # skip connection + layernorm
-        out1 = self.encoder_norm(
-            name=name+"/ln1")(inputs + attn_output * alpha)
-        activations[name + "/ln1"] = out1
+        if self.parallel_layers:
+            # feed-forward network
+            ffn_output, activations_ffn = self.ffn(inputs, emb_size, dff,
+                                xavier_norm, name=name + "/ffn", glu=self.glu)
+            ffn_output = tf.keras.layers.Dropout(
+                self.dropout_rate, name=name + "/dropout2")(ffn_output, training=training)
+            
+            activations.update(activations_ffn)
+                    
+            out2 = self.encoder_norm(
+                name=name+"/ln1")(inputs + (ffn_output + attn_output) * alpha)
+            activations[name + "/ln1"] = out2
+            
+        else:
+            # skip connection + layernorm
+            out1 = self.encoder_norm(
+                name=name+"/ln1")(inputs + attn_output * alpha)
+            activations[name + "/ln1"] = out1
 
-        # feed-forward network
-        ffn_output, activations_ffn = self.ffn(out1, emb_size, dff,
-                              xavier_norm, name=name + "/ffn", glu=self.glu)
-        ffn_output = tf.keras.layers.Dropout(
-            self.dropout_rate, name=name + "/dropout2")(ffn_output, training=training)
-        
-        activations.update(activations_ffn)
+            # feed-forward network
+            ffn_output, activations_ffn = self.ffn(out1, emb_size, dff,
+                                xavier_norm, name=name + "/ffn", glu=self.glu)
+            ffn_output = tf.keras.layers.Dropout(
+                self.dropout_rate, name=name + "/dropout2")(ffn_output, training=training)
+            
+            activations.update(activations_ffn)
 
-        out2 = self.encoder_norm(
-            name=name+"/ln2")(out1 + ffn_output * alpha)
-        activations[name + "/ln2"] = out2
+            out2 = self.encoder_norm(
+                name=name+"/ln2")(out1 + ffn_output * alpha)
+            activations[name + "/ln2"] = out2
 
         return out2, attn_wts, activations
 
