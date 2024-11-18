@@ -103,6 +103,9 @@ message Weights {
     optional Layer s2=17;
     optional Layer dense_s=18;
 
+    optional Layer nla_w = 19;
+    optional Layer nla_b = 20;
+
 
     
   }
