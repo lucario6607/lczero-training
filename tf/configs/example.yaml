@@ -1,83 +1,78 @@
 %YAML 1.2
 --- 
-name: "8x256-256"
-gpu: 0
+name: 'nla2-x'
+gpu:  1
 dataset:
   num_chunks: 500_000_000
   allow_less_chunks: true
   train_ratio: 0.95
-  sort_type: name
   input_train: 
-    - '/mnt/t82data/training-run1-test80-202309*/'
+    - '/mnt2/t82data/training-run1-test80-202404*/'
+    # - "/mnt2/t82testdata/*/"
   input_test:
-    - '/mnt/testdata/*/'
-  # input_validation:
-  # #  - '/mnt/data/validation-rescored/'
+    - "/mnt2/t82testdata/*/"
   train_workers: 8
   test_workers: 4
   fast_chunk_loading: false
-  # pc_min: 0
-  # pc_max: 6
+
 training:
-    precision: half 
-    swa: false
-    swa_output: false  
-    swa_max_n: 10
-    swa_steps: 100
-    max_grad_norm: 10.0
-    batch_size: 1024
-    num_batch_splits: 1
-    value_focus_min: 1.0
-    value_focus_slope: 0.0
-    lookahead_optimizer: false
-    renorm: true
-    renorm_max_r: 1.0
-    renorm_max_d: 0.0
-    test_steps: 1_000
-    disable_pb_checkpointing: false
-    checkpoint_activations: false
+  precision: half 
+  swa: true
+  swa_output: false  
+  swa_max_n: 10
+  swa_steps: 100
+  max_grad_norm: 10.0
+  batch_size: 1024
+  num_batch_splits: 1
+  value_focus_min: 1.0
+  value_focus_slope: 0.0
+  lookahead_optimizer: false
+  renorm: true
+  renorm_max_r: 1.0
+  renorm_max_d: 0.0
+  test_steps: 1_000
+  disable_pb_checkpointing: true
 
-    # validation_steps: 5000
-    num_test_positions: 131_072
-    train_avg_report_steps: 1_000
-    total_steps: 3_000_000
-    checkpoint_steps: 100_000
-    shuffle_size: 2_000_000
-    warmup_steps: 1000
-    mask_legal_moves: true
-    lr_values: 
-        - 0.001
-        - 0.000316
-        - 0.0001
-    lr_boundaries:
-        - 2_400_000
-        - 2_700_000
-    loss_weights:
-        policy: 1.0
-        policy_optimistic_st: 0.0
-        policy_soft: 8.0 # loss is much smaller at optimum
-        policy_opponent: 0.00
-        policy_next: 0.00
-        value_winner: 1.0
-        value_q: 1.0
-        value_q_cat: 0.1
-        value_st: 1.0 # larger because mse loss
-        value_q_err: 1.0  # both error weights should be the same
-        value_st_err: 1.0
-        value_st_cat: 0.1
-        moves_left: 1.0
-        reg: 1.0
-        future: 0.1
-    path: 'networks'
+  # validation_steps: 5000
+  num_test_positions: 131_072
+  train_avg_report_steps: 1_000
+  total_steps: 2_000_000
+  checkpoint_steps: 100_000
+  shuffle_size: 2_000_000
+  warmup_steps: 1000
+  mask_legal_moves: true
+  lr_values: 
+      - 0.0002
+      - 0.00006
+      - 0.00002
+  lr_boundaries:
+      - 1_600_000
+      - 1_800_000
+  loss_weights:
+      policy: 1.0
+      policy_optimistic_st: 0.0
+      policy_soft: 8.0 # loss is much smaller at optimum
+      policy_opponent: 0.00
+      policy_next: 0.00
+      value_winner: 1.0
+      value_q: 1.0
+      value_q_cat: 0.0
+      value_st: 1.0 # larger because mse loss
+      value_q_err: 1.0  # both error weights should be the same
+      value_st_err: 1.0
+      value_st_cat: 0.0
+      moves_left: 1.0
+      reg: 1.0
+  path: 'networks'
 
-    optimizer: nadam # sgd/nadam/rmsprop/adabelief/adam
-    beta_1: 0.9 
-    beta_2: 0.98 
-    epsilon: 0.00000001 # 1e-7
-    sparse: false
+  optimizer: nadam # sgd/nadam/rmsprop/adabelief/adam
+  beta_1: 0.9 
+  beta_2: 0.98 
+  epsilon: 0.00000001 # 1e-7
+  sparse: false
 
-    return_attn_wts: false
-    return_activations: false
+  return_attn_wts: false
+  return_activations: false
 
 model:
 
@@ -86,7 +81,7 @@ model:
     policy_embedding_size: 256
     value_embedding_size: 32
     moves_left_embedding_size: 32
-    encoder_layers: 8                   # number of intermediate attention layers in the policy head
+    encoder_layers: 28                   # number of intermediate attention layers in the policy head
     encoder_heads: 8                    # number of attention heads in encoder layers, emb // (32 or 64) recommended
                                          # with 64 memory is same as embedding, with 32 is double
     encoder_d_model: 256                 # size of the Q, K, & V vectors in encoder layers -- divisible by encoder_heads
@@ -104,16 +99,11 @@ model:
     input_type: 'classic'
 
     # Smolgen
-    use_smolgen: false
+    use_smolgen: true
     smolgen_hidden_channels: 16
     smolgen_hidden_sz: 64
     smolgen_gen_sz: 64
     smolgen_activation: 'swish'
-
-    # RPE
-    use_rpe_q: true
-    use_rpe_k: true
-    use_rpe_v: true
 
     # Gating
     use_logit_gating: false
@@ -122,6 +112,9 @@ model:
     omit_qkv_biases: true # these two increases training speed by ~10% on BT4 
     encoder_rms_norm: true # without quality degradation
 
+    nla: true
+    parallel_layers: true
+
     # Output heads
     policy_optimistic_st: false
     policy_opponent: false
@@ -129,13 +122,5 @@ model:
     value_st: true
     value_q: true
     soft_policy: true
-    categorical_value_buckets: 32
+    categorical_value_buckets: 0
     soft_policy_temperature: 4.0
-
-    # quantization
-    quantize_activations: false
-    quantize_weights: false
-    quantize_activation_bits: 8
-    quantize_weight_bits: 8
-    quantize_channels: false
-    rep_quant: false
