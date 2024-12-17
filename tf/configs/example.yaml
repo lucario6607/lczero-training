@@ -1,6 +1,6 @@
 %YAML 1.2
 --- 
-name: 'nla2-x'
+name: 'nla2-x-2'
 gpu:  1
 dataset:
   num_chunks: 500_000_000

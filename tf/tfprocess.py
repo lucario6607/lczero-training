@@ -402,7 +402,7 @@ class TFProcess:
 
 
         self.parallel_layers = self.cfg["model"].get("parallel_layers", False)
-        self.nla = self.cfg["model"].get("nla", False)
+        self.use_nla = self.cfg["model"].get("nla", False)
 
 
         # Network structure
@@ -418,6 +418,8 @@ class TFProcess:
         self.encoder_d_model = self.cfg["model"].get("encoder_d_model")
         self.categorical_value_buckets = self.cfg["model"].get(
             "categorical_value_buckets", 0)
+
+        self.att_expansion = self.cfg["model"].get("att_expansion", 1)
 
 
         self.encoder_dff = self.cfg["model"].get(
@@ -579,6 +581,7 @@ class TFProcess:
         if self.encoder_layers > 0:
             self.net.set_headcount(self.encoder_heads)
             self.net.set_networkformat(
+                 pb.NetworkFormat.NETWORK_ATTENTIONBODY_NLA_WITH_MULTIHEADFORMAT if self.use_nla else
                 pb.NetworkFormat.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT)
             self.net.set_smolgen_activation(
                 self.net.activation(self.smolgen_activation))
@@ -1702,6 +1705,7 @@ class TFProcess:
         value_st = outputs.get("value_st")
         value_st_err = outputs.get("value_st_err")
         value_st_cat = outputs.get("value_st_cat")
+        
 
         policy = outputs["policy"]
         policy_optimistic_st = outputs.get("policy_optimistic_st")
@@ -1966,13 +1970,8 @@ class TFProcess:
 
         # 0 h 64 d, 0 h 64 d
         dk = tf.cast(tf.shape(k)[-1], self.model_dtype)
-        scaleDivisor = tf.pow(dk, 0.25)
-        # q = q / scaleDivisor
-        # k = k / scaleDivisor
-
         matmul_qk = tf.matmul(q, k, transpose_b=True)
-        batch_size = tf.shape(q)[0]
-        heads = q.shape[1]
+        heads = v.shape[1]
 
 
 
@@ -1982,7 +1981,7 @@ class TFProcess:
             matmul_qk = matmul_qk + RPELogits(name=name+"/rpe_k", rpe_type='k')(k)
 
 
-        scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
+        scaled_attention_logits = matmul_qk / tf.math.sqrt(dk) if self.att_expansion == 1 else 0
 
         if self.use_smolgen:
             smolgen_weights = self.smolgen_weights(inputs, heads, self.smolgen_hidden_channels, self.smolgen_hidden_sz,
@@ -2023,7 +2022,7 @@ class TFProcess:
 
         activations = {}
 
-        if self.nla:
+        if self.use_nla:
             inputs = DenseLayer(depth, name=name+"/nla", kernel_initializer="glorot_normal", use_bias=True, activation=self.DEFAULT_ACTIVATION)(inputs)
 
         if self.use_absolute_pe:
@@ -2134,7 +2133,7 @@ class TFProcess:
 
         # multihead attention
         attn_output, attn_wts, activations_mha = self.mha(
-            inputs, emb_size, d_model, num_heads, xavier_norm, name=name + "/mha")
+            inputs, emb_size, d_model, num_heads, xavier_norm, name=name + "/mha", att_expansion=self.att_expansion)
 
         activations.update(activations_mha)
 

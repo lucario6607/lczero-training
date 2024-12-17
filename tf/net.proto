@@ -105,9 +105,6 @@ message Weights {
 
     optional Layer nla_w = 19;
     optional Layer nla_b = 20;
-
-
-    
   }
 
   message FFN {
@@ -310,6 +307,8 @@ message NetworkFormat {
     NETWORK_CLASSICAL_WITH_MULTIHEADFORMAT = 131;
     NETWORK_SE_WITH_MULTIHEADFORMAT = 132;
     NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT = 134;
+    NETWORK_ATTENTIONBODY_NLA_WITH_MULTIHEADFORMAT = 8;
+
   }
   optional NetworkStructure network = 3;
 

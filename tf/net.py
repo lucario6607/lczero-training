@@ -255,6 +255,8 @@ class Net:
                 return l
             elif l.startswith('dense'):
                 s = 'dense'
+            elif l.startswith('nla'):
+                s = 'nla'
             elif l.startswith('w'):
                 s = l[1]
                 
