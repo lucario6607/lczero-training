@@ -139,7 +139,11 @@ def game_number_for_name(name):
 
 
 def get_input_mode(cfg):
+    if not os.path.exists("proto/net_pb2.py"):
+        raise ValueError("proto/net_pb2.py not found. Run 'init.sh' to generate it, then re-run this script.")
+    
     import proto.net_pb2 as pb
+
     input_mode = cfg["model"].get("input_type", "classic")
 
     if input_mode == "classic":

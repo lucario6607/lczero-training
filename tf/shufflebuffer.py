@@ -60,7 +60,7 @@ class ShuffleBuffer:
 
             If the buffer is not yet full, returns None
         """
-        assert len(item) == self.elem_size, len(item)
+        assert len(item) == self.elem_size, f"""Wrong data size in shuffle buffer, got {len(item)} but expected {self.elem_size}. This likely means that your data is out of date. Please use the rescorer to convert your training data to version 7 or download v7 training data."""
         # putting the new item in a random location, and appending
         # the displaced item to the end of the buffer achieves a full
         # random shuffle (Fisher-Yates)
