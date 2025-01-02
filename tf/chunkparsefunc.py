@@ -18,7 +18,7 @@
 import tensorflow as tf
 
 
-def parse_function(planes, probs, winner, q, plies_left, st_q, opp_probs, next_probs, fut):
+def parse_function(planes, probs, winner, q, plies_left, st_q, opp_idx, next_idx):
     """
     Convert unpacked record batches to tensors for tensorflow training
     """
@@ -28,10 +28,8 @@ def parse_function(planes, probs, winner, q, plies_left, st_q, opp_probs, next_p
     q = tf.io.decode_raw(q, tf.float32)
     plies_left = tf.io.decode_raw(plies_left, tf.float32)
     st_q = tf.io.decode_raw(st_q, tf.float32)
-    opp_probs = tf.io.decode_raw(opp_probs, tf.float32)
-    next_probs = tf.io.decode_raw(next_probs, tf.float32)
-    fut = tf.io.decode_raw(fut, tf.float32)
-
+    opp_idx = tf.io.decode_raw(opp_idx, tf.int32)
+    next_idx = tf.io.decode_raw(next_idx, tf.int32)
 
     planes = tf.reshape(planes, (-1, 112, 8, 8))
     probs = tf.reshape(probs, (-1, 1858))
@@ -39,11 +37,7 @@ def parse_function(planes, probs, winner, q, plies_left, st_q, opp_probs, next_p
     q = tf.reshape(q, (-1, 3))
     plies_left = tf.reshape(plies_left, (-1, 1))
     st_q = tf.reshape(st_q, (-1, 3))
-    opp_probs = tf.reshape(opp_probs, (-1, 1858))
-    next_probs = tf.reshape(next_probs, (-1, 1858))
-    fut = tf.reshape(fut, (-1, 16, 12, 64))
-    fut = tf.transpose(fut, perm=[0, 3, 1, 2])
-    fut = tf.concat([fut, 1 - tf.reduce_sum(fut, axis=-1, keepdims=True)], axis=-1)
+    opp_idx = tf.reshape(opp_idx, (-1,))
+    next_idx = tf.reshape(next_idx, (-1,))
 
-
-    return (planes, probs, winner, q, plies_left, st_q, opp_probs, next_probs, fut)
+    return (planes, probs, winner, q, plies_left, st_q, opp_idx, next_idx)
