@@ -1,141 +1,78 @@
 %YAML 1.2
 --- 
-name: "8x256-256"
+name: "mamba2-8x128-multidata" # Name reflects the new, combined dataset
 gpu: 0
 dataset:
-  num_chunks: 500_000_000
+  num_chunks: 30000000
   allow_less_chunks: true
   train_ratio: 0.95
   sort_type: name
-  input_train: 
-    - '/mnt/t82data/training-run1-test80-202309*/'
-  input_test:
-    - '/mnt/testdata/*/'
-  # input_validation:
-  # #  - '/mnt/data/validation-rescored/'
-  train_workers: 8
-  test_workers: 4
   fast_chunk_loading: false
-  # pc_min: 0
-  # pc_max: 6
-training:
-    precision: half 
-    swa: false
-    swa_output: false  
-    swa_max_n: 10
-    swa_steps: 100
-    max_grad_norm: 10.0
-    batch_size: 1024
-    num_batch_splits: 1
-    value_focus_min: 1.0
-    value_focus_slope: 0.0
-    lookahead_optimizer: false
-    renorm: true
-    renorm_max_r: 1.0
-    renorm_max_d: 0.0
-    test_steps: 1_000
-    disable_pb_checkpointing: false
-    checkpoint_activations: false
+  
+  # --- UPDATED DATA PATHS ---
+  # The training script will now pull data from all of these directories.
+  input: 
+    - '/notebooks/training-run1-test80-20220404-0817/'
+    - '/notebooks/training-run1-test80-20240129-1017/'
+    - '/notebooks/training-run1-test80-20240208-1417/'
+    - '/notebooks/training-run1-test80-20240214-0217/'
+    - '/notebooks/training-run1-test80-20250620-0017/'
+    - '/notebooks/training-run1-test80-20250620-0117/'
+    - '/notebooks/training-run1-test80-20250620-0317/'
+  # --- END OF UPDATED PATHS ---
 
-    # validation_steps: 5000
-    num_test_positions: 131_072
-    train_avg_report_steps: 1_000
-    total_steps: 3_000_000
-    checkpoint_steps: 100_000
-    shuffle_size: 2_000_000
+training:
+    # Using bfloat16 for the best balance of stability and memory efficiency
+    precision: bfloat16 
+    
+    batch_size: 4096
+    num_batch_splits: 16
+    shuffle_size: 800000 
+    test_steps: 1000
+    train_avg_report_steps: 1000
+    checkpoint_steps: 100000
+    total_steps: 3000000
+    path: 'networks' 
+    optimizer: nadam
     warmup_steps: 1000
-    mask_legal_moves: true
-    lr_values: 
-        - 0.001
-        - 0.000316
-        - 0.0001
-    lr_boundaries:
-        - 2_400_000
-        - 2_700_000
+    lr_values: [0.001, 0.000316, 0.0001]
+    lr_boundaries: [2400000, 2700000]
     loss_weights:
         policy: 1.0
-        policy_optimistic_st: 0.0
-        policy_soft: 8.0 # loss is much smaller at optimum
-        policy_opponent: 0.00
-        policy_next: 0.00
         value_winner: 1.0
-        value_q: 1.0
-        value_q_cat: 0.1
-        value_st: 1.0 # larger because mse loss
-        value_q_err: 1.0  # both error weights should be the same
-        value_st_err: 1.0
-        value_st_cat: 0.1
-        moves_left: 1.0
-        reg: 1.0
-        future: 0.1
-    path: 'networks'
-
-    optimizer: nadam # sgd/nadam/rmsprop/adabelief/adam
-    beta_1: 0.9 
-    beta_2: 0.98 
-    epsilon: 0.00000001 # 1e-7
-    sparse: false
-
-    return_attn_wts: false
-    return_activations: false
+        moves_left: 0.1
+        reg: 0.000001
 
 model:
+    network: 'mamba2'
+    
+    # Model size configuration for 8 layers, 128 depth
+    embedding_size: 128
+    encoder_layers: 8
 
-    # Dimension parameters
-    embedding_size: 256
-    policy_embedding_size: 256
-    value_embedding_size: 32
-    moves_left_embedding_size: 32
-    encoder_layers: 8                   # number of intermediate attention layers in the policy head
-    encoder_heads: 8                    # number of attention heads in encoder layers, emb // (32 or 64) recommended
-                                         # with 64 memory is same as embedding, with 32 is double
-    encoder_d_model: 256                 # size of the Q, K, & V vectors in encoder layers -- divisible by encoder_heads
-    encoder_dff: 256                    # size of the expansion layer in encoder layer ffn
-    policy_d_model: 256                  # size of the query and key vectors in final attention layer
-    policy_d_aux: 256                     # size of the query and key vectors for auxiliary layers
-    dropout_rate: 0.0                    # the dropout rate used for weight regularization of attention during training
-                                        # makes memory 33 -> 39 GB on A100 as observed by Teck and Kovax
-
-    embedding_style: "old"
-    embedding_dense_sz: 32
-
+    # Derived parameters
+    mamba2_num_heads: 8
+    mamba2_head_dim: 16
+    mamba2_dt_rank: 8
+    
     value: 'wdl'
     moves_left: 'v1'
     input_type: 'classic'
-
-    # Smolgen
-    use_smolgen: false
-    smolgen_hidden_channels: 16
-    smolgen_hidden_sz: 64
-    smolgen_gen_sz: 64
-    smolgen_activation: 'swish'
-
-    # RPE
-    use_rpe_q: true
-    use_rpe_k: true
-    use_rpe_v: true
-
-    # Gating
-    use_logit_gating: false
-
-    # Ablations
-    omit_qkv_biases: true # these two increases training speed by ~10% on BT4 
-    encoder_rms_norm: true # without quality degradation
-
-    # Output heads
-    policy_optimistic_st: false
-    policy_opponent: false
-    policy_next: false
+    default_activation: 'swish'
+    
+    # Flags to correctly parse the data
     value_st: true
     value_q: true
     soft_policy: true
-    categorical_value_buckets: 32
-    soft_policy_temperature: 4.0
+    value_q_err: false
+    value_st_err: false
+    categorical_value_buckets: 0
 
-    # quantization
-    quantize_activations: false
-    quantize_weights: false
-    quantize_activation_bits: 8
-    quantize_weight_bits: 8
-    quantize_channels: false
-    rep_quant: false
+    # Mamba / RoPE settings
+    rope_2d_enabled: true
+    rope_2d_theta: 10000.0
+    mamba2_d_state: 16
+    mamba2_d_conv: 4
+    mamba2_expand_factor: 2
+    mamba2_chunk_size: 256
+    mamba2_use_norm: true
