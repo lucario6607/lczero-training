@@ -1,11 +1,52 @@
-#!/usr/bin/env python3
+import os
+import time
 import numpy as np
-import os, time, tensorflow as tf
+import tensorflow as tf
 import traceback
-import net_pb2 as pb
-from net import Net
+from chunkparser import create_dataset
+import gzip
+import re # Import the regular expression module
 
-# --- Keras Layers ---
+# --- Import new dependencies for Sparsity and add a check ---
+try:
+    import tensorflow_model_optimization as tfmot
+    sparsity_available = True
+except ImportError:
+    print("Warning: tensorflow_model_optimization not found. Sparsity will be disabled.")
+    sparsity_available = False
+
+
+# --- Import the CORRECT conversion tools ---
+try:
+    from net import Net, pb
+except ImportError:
+    print("Warning: net.py or its dependencies not found. .pb.gz export will be disabled.")
+    Net = None
+    pb = None
+
+
+# --- Keras Layers and Schedules ---
+
+class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, initial_learning_rate, warmup_steps, total_steps, name=None):
+        super().__init__()
+        self.initial_learning_rate = float(initial_learning_rate)
+        self.warmup_steps = float(warmup_steps)
+        self.total_steps = float(total_steps)
+        self.name = name
+    def __call__(self, step):
+        with tf.name_scope(self.name or "WarmupCosineDecay"):
+            step = tf.cast(step, tf.float32)
+            def warmup_fn():
+                return self.initial_learning_rate * (step / self.warmup_steps)
+            def decay_fn():
+                decay_steps = tf.maximum(1.0, self.total_steps - self.warmup_steps)
+                cosine_decay = 0.5 * (1 + tf.cos(np.pi * (step - self.warmup_steps) / decay_steps))
+                return self.initial_learning_rate * cosine_decay
+            return tf.cond(step < self.warmup_steps, warmup_fn, decay_fn)
+    def get_config(self):
+        return {"initial_learning_rate": self.initial_learning_rate, "warmup_steps": self.warmup_steps, "total_steps": self.total_steps, "name": self.name}
+
 class RMSNorm(tf.keras.layers.Layer):
     def __init__(self, eps=1e-6, **kwargs):
         super().__init__(**kwargs)
@@ -13,303 +54,460 @@ class RMSNorm(tf.keras.layers.Layer):
     def build(self, input_shape):
         self.gamma = self.add_weight(name="gamma", shape=(input_shape[-1],), initializer="ones", trainable=True)
     def call(self, x):
-        x = tf.where(tf.math.is_finite(x), x, tf.zeros_like(x))
         variance = tf.reduce_mean(tf.square(x), axis=-1, keepdims=True)
         inv_rms = tf.math.rsqrt(tf.maximum(variance, self.eps))
-        inv_rms = tf.where(tf.math.is_finite(inv_rms), inv_rms, tf.zeros_like(inv_rms))
-        result = x * inv_rms * self.gamma
-        return tf.where(tf.math.is_finite(result), result, x)
-
-class RotaryPositionEmbedding2D(tf.keras.layers.Layer):
-    def __init__(self, head_dim, theta=10000.0, **kwargs):
-        super().__init__(**kwargs)
-        self.head_dim, self.theta = head_dim, float(theta)
-    def build(self, input_shape):
-        dim = self.head_dim
-        indices = np.arange(0, self.head_dim, 2, dtype=np.float32)
-        inv_freq = 1.0 / (self.theta ** (indices / self.head_dim))
-        pos_x, pos_y = np.meshgrid(np.arange(8), np.arange(8))
-        pos = np.stack([pos_y, pos_x], axis=-1).reshape(64, 2)
-        freqs = np.clip(np.einsum('ij,k->ijk', pos, inv_freq).reshape(64, dim), -20.0, 20.0)
-        cos_vals, sin_vals = np.cos(freqs), np.sin(freqs)
-        self.cos_emb = self.add_weight(name="cos_emb", shape=(64, dim), initializer=tf.constant_initializer(cos_vals), trainable=False)
-        self.sin_emb = self.add_weight(name="sin_emb", shape=(64, dim), initializer=tf.constant_initializer(sin_vals), trainable=False)
-    def call(self, x):
-        x = tf.where(tf.math.is_finite(x), x, tf.zeros_like(x))
-        x_rotated = tf.concat([-x[..., self.head_dim//2:], x[..., :self.head_dim//2]], axis=-1)
-        result = x * self.cos_emb + x_rotated * self.sin_emb
-        return tf.where(tf.math.is_finite(result), result, x)
+        return x * inv_rms * self.gamma
 
 class Mamba2Block(tf.keras.layers.Layer):
     def __init__(self, d_model, d_state, d_conv, expand, dt_rank, **kwargs):
-        kwargs['dtype'] = tf.float32 
         super().__init__(**kwargs)
         self.d_i, self.d_s, self.dt_r, self.d_c, self.d_m = int(expand * d_model), min(d_state, 16), dt_rank, d_conv, d_model
+
     def build(self, input_shape):
         he_init = tf.keras.initializers.HeNormal(seed=42)
-        sm_init = tf.keras.initializers.RandomNormal(stddev=0.01, seed=43)
-        tiny_init = tf.keras.initializers.RandomNormal(stddev=0.001, seed=44)
-        self.norm = RMSNorm(name="norm", dtype=tf.float32)
-        self.in_proj = tf.keras.layers.Dense(self.d_i * 2, use_bias=False, name="in_proj", dtype=tf.float32, kernel_initializer=he_init)
-        self.conv1d = tf.keras.layers.Conv1D(self.d_i, self.d_c, padding="causal", name="conv1d", activation=None, dtype=tf.float32, kernel_initializer=he_init)
-        self.x_proj = tf.keras.layers.Dense(self.dt_r + self.d_s * 2, use_bias=False, name="x_proj", dtype=tf.float32, kernel_initializer=sm_init)
-        self.dt_proj = tf.keras.layers.Dense(self.d_i, name="dt_proj", dtype=tf.float32, kernel_initializer=tiny_init, bias_initializer=tf.constant_initializer(-2.0))
+        self.norm = RMSNorm(name="norm")
+        self.in_proj = tf.keras.layers.Dense(use_bias=False, name="in_proj", kernel_initializer=he_init, units=self.d_i * 2)
+        self.conv1d = tf.keras.layers.Conv1D(filters=self.d_i, kernel_size=self.d_c, padding="causal", name="conv1d", activation=None, kernel_initializer=he_init)
+        self.x_proj = tf.keras.layers.Dense(use_bias=False, name="x_proj", kernel_initializer=he_init, units=self.dt_r + self.d_s * 2)
+        self.dt_proj = tf.keras.layers.Dense(name="dt_proj", kernel_initializer=he_init, bias_initializer=tf.constant_initializer(-2.0), units=self.d_i)
+        self.out_proj = tf.keras.layers.Dense(use_bias=False, name="out_proj", kernel_initializer=he_init, units=self.d_m)
         self.D = self.add_weight(name="D", shape=(self.d_i,), initializer=tf.constant_initializer(0.01), trainable=True)
-        self.out_proj = tf.keras.layers.Dense(self.d_m, use_bias=False, name="out_proj", dtype=tf.float32, kernel_initializer=he_init)
         a_log_init = np.clip(-np.log(np.linspace(0.5, 2.0, self.d_s)), -5.0, 0.0)
         self.A_log = self.add_weight(name="A_log", shape=(self.d_i, self.d_s), initializer=tf.constant_initializer(np.tile(a_log_init, (self.d_i, 1))), trainable=True)
-    def safe_softplus(self, x):
-        return tf.nn.softplus(tf.clip_by_value(x, -20.0, 20.0))
+    
     def ssm_manual_loop(self, x, dt, B, C):
-        batch_size, seq_len, _ = tf.unstack(tf.shape(x))
-        x, dt, B, C = [tf.where(tf.math.is_finite(t), t, tf.zeros_like(t)) for t in [x, dt, B, C]]
-        A = -tf.exp(tf.clip_by_value(self.A_log, -5.0, 0.0))
-        dt_raw = self.dt_proj(dt)
-        delta = tf.clip_by_value(self.safe_softplus(tf.clip_by_value(dt_raw, -5.0, 0.0)), 1e-8, 0.01)
-        h = tf.zeros((batch_size, self.d_i, self.d_s), dtype=self.compute_dtype)
-        outputs_ta = tf.TensorArray(dtype=self.compute_dtype, size=seq_len, clear_after_read=False)
-        A_expanded = tf.expand_dims(A, 0)
+        seq_len = tf.shape(x)[1]
+        outputs_ta = tf.TensorArray(dtype=self.compute_dtype, size=seq_len)
+        h = tf.zeros((tf.shape(x)[0], self.d_i, self.d_s), dtype=self.compute_dtype)
+        A = -tf.exp(self.A_log); delta = tf.nn.softplus(self.dt_proj(dt))
         for t in tf.range(seq_len):
-            delta_t, x_t, B_t, C_t = delta[:, t, :], x[:, t, :], B[:, t, :], C[:, t, :]
-            delta_A_t = tf.exp(tf.clip_by_value(tf.expand_dims(delta_t, -1) * A_expanded, -10.0, 0.0))
-            delta_B_u_t = tf.clip_by_value((tf.expand_dims(delta_t, -1) * tf.expand_dims(B_t, 1)) * tf.expand_dims(x_t, -1), -10.0, 10.0)
-            h_new = tf.clip_by_value(delta_A_t * h + delta_B_u_t, -50.0, 50.0)
-            h = tf.where(tf.math.is_finite(h_new), h_new, h * 0.9)
-            y_t = tf.reduce_sum(h * tf.expand_dims(C_t, 1), axis=-1)
-            outputs_ta = outputs_ta.write(t, tf.where(tf.math.is_finite(y_t), y_t, tf.zeros_like(y_t)))
+            delta_t, x_t, B_t, C_t = delta[:, t], x[:, t], B[:, t], C[:, t]
+            delta_B = tf.expand_dims(delta_t, -1) * tf.expand_dims(B_t, 1); delta_A = tf.exp(tf.expand_dims(delta_t, -1) * A)
+            delta_B_u = delta_B * tf.expand_dims(x_t, -1); h = delta_A * h + delta_B_u
+            y_t = tf.reduce_sum(h * tf.expand_dims(C_t, 1), axis=-1); outputs_ta = outputs_ta.write(t, y_t)
         return tf.transpose(outputs_ta.stack(), perm=[1, 0, 2])
-    def call(self, x):
-        x_fp32 = tf.cast(x, tf.float32)
-        residual = tf.where(tf.math.is_finite(x_fp32), x_fp32, tf.zeros_like(x_fp32))
-        x_norm = self.norm(residual)
-        x_proj = tf.where(tf.math.is_finite(self.in_proj(x_norm)), self.in_proj(x_norm), tf.zeros_like(self.in_proj(x_norm)))
-        x_in, z = tf.split(x_proj, 2, axis=-1)
-        x_conv = self.conv1d(x_in)
-        x_conv = tf.nn.swish(tf.clip_by_value(tf.where(tf.math.is_finite(x_conv), x_conv, tf.zeros_like(x_conv)), -10.0, 10.0))
-        x_proj_out = tf.where(tf.math.is_finite(self.x_proj(x_conv)), self.x_proj(x_conv), tf.zeros_like(self.x_proj(x_conv)))
-        dt_in, B_in, C_in = tf.split(x_proj_out, [self.dt_r, self.d_s, self.d_s], axis=-1)
-        y = self.ssm_manual_loop(x_conv, dt_in, B_in, C_in)
-        D_safe = tf.where(tf.math.is_finite(self.D), self.D, tf.ones_like(self.D) * 0.01)
-        y_skip = y + x_conv * D_safe
-        z_activated = tf.nn.silu(tf.clip_by_value(tf.where(tf.math.is_finite(z), z, tf.zeros_like(z)), -10.0, 10.0))
-        y_gated = tf.where(tf.math.is_finite(y_skip * z_activated), y_skip * z_activated, tf.zeros_like(y_skip * z_activated))
-        output = tf.clip_by_value(self.out_proj(y_gated), -5.0, 5.0)
-        output = tf.where(tf.math.is_finite(output), output, tf.zeros_like(output))
-        result_fp32 = tf.where(tf.math.is_finite(residual + output), residual + output, residual)
-        return tf.cast(result_fp32, x.dtype)
+
+    def call(self, x, training=None):
+        residual = x; x = self.norm(x)
+        x_proj, z = tf.split(self.in_proj(x), 2, axis=-1); x_conv = tf.nn.swish(self.conv1d(x_proj))
+        dt_in, B_in, C_in = tf.split(self.x_proj(x_conv), [self.dt_r, self.d_s, self.d_s], axis=-1)
+        y = self.ssm_manual_loop(x_conv, dt_in, B_in, C_in); y = y + x_conv * self.D; y = y * tf.nn.silu(z)
+        return residual + self.out_proj(y)
+
+class CheckpointWrapper(tf.keras.layers.Layer):
+    def __init__(self, layer, **kwargs): 
+        super().__init__(**kwargs)
+        self.layer = layer
+    def call(self, inputs, training=None, **kwargs):
+        def recompute_fn(x):
+            return self.layer(x, training=training, **kwargs)
+        return tf.recompute_grad(recompute_fn)(inputs)
 
 # --- Main Training Process Class ---
 class TFProcess:
     def __init__(self, cfg):
-        self.cfg = cfg
-        self.mcfg = cfg["model"]
-        self.tcfg = cfg["training"]
-        self.net_type = self.mcfg.get("network", "attention_body")
-        self.strategy = None
+        self.cfg = cfg; self.mcfg = cfg["model"]; self.tcfg = cfg["training"]
         self.root_dir = os.path.join(self.tcfg["path"], self.cfg["name"])
-        net_kwargs = {'valueformat': pb.NetworkFormat.VALUE_WDL if self.mcfg.get('value') == 'wdl' else pb.NetworkFormat.VALUE_CLASSICAL}
-        if self.net_type == 'mamba2':
-            net_kwargs['net_fmt'] = pb.NetworkFormat.NETWORK_MAMBA2_WITH_HEADFORMAT
-            for p in ['d_state', 'd_conv', 'expand_factor', 'num_heads', 'head_dim', 'chunk_size', 'dt_rank', 'use_norm', 'rope_2d_enabled', 'rope_2d_theta']:
-                param_name = f"mamba2_{p}" if p not in ['rope_2d_enabled', 'rope_2d_theta'] else p
-                if param_name in self.mcfg: net_kwargs[param_name] = self.mcfg[param_name]
-        self.net = Net(**net_kwargs)
-        tf.keras.mixed_precision.set_global_policy('float32')
+        tf.keras.mixed_precision.set_global_policy('mixed_float16')
+        self.use_sparsity = False
+        self.pruning_params = None
 
-    def init(self, train_ds, test_ds, validation_dataset=None):
-        self.train_iter, self.test_iter = iter(train_ds), iter(test_ds)
-        inputs = tf.keras.Input(shape=(112, 8, 8), name="input_planes")
-        outputs = self.construct_net(inputs)
-        self.model = tf.keras.Model(inputs, outputs)
-        print(f"Model '{self.mcfg['network']}' created with {self.model.count_params():,} parameters.")
-        lr = min(self.tcfg.get("learning_rate", 0.001), 0.0001)
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr, beta_1=0.9, beta_2=0.999, epsilon=1e-8, clipnorm=0.5)
-        self.weight_decay = 1e-5
-        self.global_step = tf.Variable(0, name='global_step', trainable=False, dtype=tf.int64)
-        self.checkpoint = tf.train.Checkpoint(optimizer=self.optimizer, model=self.model, global_step=self.global_step)
+    def construct_net(self):
+        mcfg = self.mcfg
+        original_policy = tf.keras.mixed_precision.global_policy()
+        model_construction_policy = 'float32' if self.use_sparsity else original_policy.name
+        
+        if self.use_sparsity:
+            print(f"Temporarily setting global policy to '{model_construction_policy}' for model construction.")
+            tf.keras.mixed_precision.set_global_policy(model_construction_policy)
+        
+        model = None
+        try:
+            def prunable_layer_fn(layer_class, **kwargs):
+                layer_to_wrap = layer_class(**kwargs)
+                if self.pruning_params and isinstance(layer_to_wrap, tf.keras.layers.Dense):
+                    try:
+                        return tfmot.sparsity.keras.prune_low_magnitude(
+                            layer_to_wrap, **self.pruning_params)
+                    except Exception as e:
+                        print(f"Warning: Could not apply pruning to {layer_class.__name__}: {e}")
+                return layer_to_wrap
+
+            inp = tf.keras.Input(shape=(112, 8, 8), name="us_input", dtype=tf.float16)
+            
+            if self.use_sparsity:
+                flow = tf.cast(inp, tf.float32)
+            else:
+                flow = inp
+                
+            flow = tf.keras.layers.Permute((2, 3, 1))(flow)
+            flow = tf.keras.layers.Reshape((64, 112))(flow)
+            
+            embedding_size = mcfg['embedding_size']
+            input_dense = tf.keras.layers.Dense(name="input/dense", activation='relu', kernel_initializer='he_normal', units=embedding_size)
+            flow = input_dense(flow)
+            
+            use_checkpointing = mcfg.get('mamba2_use_checkpointing', False)
+
+            for i in range(mcfg['encoder_layers']):
+                mamba_block = Mamba2Block(embedding_size, mcfg['mamba2_d_state'], mcfg['mamba2_d_conv'], 
+                                        mcfg.get('mamba2_expand_factor', 2), mcfg['mamba2_dt_rank'],
+                                        name=f"encoder_{i}/mamba2")
+                
+                if use_checkpointing:
+                    mamba_block = CheckpointWrapper(mamba_block, name=f"encoder_{i}/checkpoint")
+                
+                flow = mamba_block(flow, training=False)
+            
+            pooled_flow = tf.keras.layers.GlobalAveragePooling1D(name="avg_pool")(flow)
+            
+            outputs = {}
+            policy_head = prunable_layer_fn(tf.keras.layers.Dense, name="policy/dense", kernel_initializer='he_normal', units=1858)
+            value_head = prunable_layer_fn(tf.keras.layers.Dense, name="value/dense", kernel_initializer='he_normal', units=3)
+            
+            outputs['policy'] = policy_head(pooled_flow, training=False)
+            outputs['value_winner'] = value_head(pooled_flow, training=False)
+            
+            model = tf.keras.Model(inputs=inp, outputs=outputs)
+            
+        except Exception as e:
+            print(f"Error during model construction: {e}")
+            traceback.print_exc()
+            raise
+        finally:
+            if self.use_sparsity and original_policy.name != model_construction_policy:
+                print(f"Restoring global policy to '{original_policy.name}'.")
+                tf.keras.mixed_precision.set_global_policy(original_policy)
+        
+        return model
+
+    def init(self):
+        use_dummy_data = self.tcfg.get('use_dummy_data', False)
+        if use_dummy_data:
+            print("WARNING: Using dummy data for testing!")
+            self.train_ds = self.create_dummy_dataset(self.tcfg['batch_size'])
+            self.test_ds = self.create_dummy_dataset(self.tcfg['batch_size'])
+        else:
+            print("Using real data from chunkparser...")
+            self.train_ds = create_dataset(self.tcfg['train_dir'], self.tcfg['batch_size'])
+            self.test_ds = create_dataset(self.tcfg['test_dir'], self.tcfg['batch_size'], is_training=False)
+        self.train_iter, self.test_iter = iter(self.train_ds), iter(self.test_ds)
+        
+        self.use_sparsity = self.tcfg.get('sparsity', {}).get('enabled', False)
+        if self.use_sparsity:
+            if not sparsity_available:
+                print("ERROR: Sparsity is enabled in config, but 'tensorflow_model_optimization' is not installed. Disabling sparsity.")
+                self.use_sparsity = False
+            else:
+                s_cfg = self.tcfg['sparsity']
+                
+                print("Applying magnitude-based sparsity to compatible layers.")
+                if s_cfg.get('type') == 'block':
+                    print("Note: 'block' sparsity type was requested but is known to be unstable. "
+                          "Falling back to standard magnitude pruning.")
+                
+                self.pruning_params = {
+                    'pruning_schedule': tfmot.sparsity.keras.PolynomialDecay(
+                        initial_sparsity=0.0,
+                        final_sparsity=s_cfg.get('target_sparsity', 0.5),
+                        begin_step=s_cfg.get('start_step', 1000),
+                        end_step=s_cfg.get('end_step', 10000),
+                        frequency=s_cfg.get('frequency', 100)
+                    )
+                }
+                
+                self.pruning_callback = tfmot.sparsity.keras.UpdatePruningStep()
+
+        self.model = self.construct_net()
+        print(f"Model created with {self.model.count_params():,} parameters.")
+
+        if self.use_sparsity:
+            try:
+                print("--- Pruning Summary ---")
+                tfmot.sparsity.keras.pruning_summary(self.model)
+                print("---------------------")
+            except Exception as e:
+                print(f"Could not print pruning summary: {e}")
+
+        initial_lr = self.tcfg.get("learning_rate", 1e-4)
+        warmup_steps = self.tcfg.get("warmup_steps", 0)
+        if warmup_steps > 0:
+            print(f"Using learning rate schedule with {warmup_steps} warmup steps.")
+            lr_schedule = WarmupCosineDecay(initial_lr, warmup_steps, self.tcfg['total_steps'])
+        else:
+            print("Using fixed learning rate.")
+            lr_schedule = initial_lr
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=1.0, epsilon=1e-7)
+        self.optimizer = tf.keras.mixed_precision.LossScaleOptimizer(self.optimizer)
+        self.global_step = self.optimizer.iterations
+        self.checkpoint = tf.train.Checkpoint(optimizer=self.optimizer, model=self.model)
         self.manager = tf.train.CheckpointManager(self.checkpoint, directory=self.root_dir, max_to_keep=5, checkpoint_name=self.cfg["name"])
+        
+        @tf.function
+        def train_step_fn(inputs_dict):
+            with tf.GradientTape() as tape:
+                predictions = self.model(inputs_dict['us'], training=True)
+                losses = {}
+                policy_loss = tf.reduce_mean(self._policy_loss_fn(inputs_dict['pi'], predictions['policy']))
+                value_loss = tf.reduce_mean(self._value_loss_fn(inputs_dict['wdl'], predictions['value_winner']))
+                losses['policy'] = policy_loss
+                losses['value_winner'] = value_loss
+                total_loss = self._lossMix(losses)
+                total_loss = tf.cast(total_loss, tf.float32)
+                
+                weight_decay_val = float(self.tcfg.get("weight_decay", 1e-5))
+                if weight_decay_val > 0:
+                    l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in self.model.trainable_variables 
+                                      if 'bias' not in v.name and len(v.shape) > 1])
+                    total_loss += weight_decay_val * l2_loss
+                
+                total_loss = tf.where(tf.math.is_finite(total_loss), total_loss, 1e-3)
+                scaled_loss = self.optimizer.get_scaled_loss(total_loss)
+            
+            scaled_grads = tape.gradient(scaled_loss, self.model.trainable_variables)
+            grads = self.optimizer.get_unscaled_gradients(scaled_grads)
+            grads = [tf.where(tf.math.is_finite(g), g, tf.zeros_like(g)) if g is not None else None for g in grads]
+            self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+            losses['total'] = total_loss
+            return losses
+        self.train_step = train_step_fn
+        
+        @tf.function
+        def test_step_fn(inputs_dict):
+            predictions = self.model(inputs_dict['us'], training=False)
+            losses = {}
+            losses['policy'] = tf.reduce_mean(self._policy_loss_fn(inputs_dict['pi'], predictions['policy']))
+            losses['value_winner'] = tf.reduce_mean(self._value_loss_fn(inputs_dict['wdl'], predictions['value_winner']))
+            losses['total'] = self._lossMix(losses)
+            return losses
+        self.test_step = test_step_fn
+    
+    def _policy_loss_fn(self, target, pred):
+        return tf.keras.losses.categorical_crossentropy(target, pred, from_logits=True)
+    
+    def _value_loss_fn(self, target, pred):
+        return tf.keras.losses.categorical_crossentropy(target, pred, from_logits=True)
+    
+    def _lossMix(self, losses):
+        policy_weight = float(self.tcfg.get('policy_loss_weight', 1.0))
+        value_weight = float(self.tcfg.get('value_loss_weight', 1.0))
+        return policy_weight * losses['policy'] + value_weight * losses['value_winner']
+    
+    def export_leela_weights(self, step):
+        if Net is None or pb is None: 
+            print("Skipping export - net.py not available")
+            return
+        print(f"Exporting network to .pb.gz format for step {step}...")
+        try:
+            model_to_export = self.model
+            if self.use_sparsity and sparsity_available:
+                print("Stripping pruning wrappers for export...")
+                model_to_export = tfmot.sparsity.keras.strip_pruning(self.model)
 
+            # FIX: Clean the weight names before passing them to the conversion script.
+            # Keras wrappers (for pruning, checkpointing) add prefixes to variable names
+            # that the external `net.py` script does not recognize. This routine
+            # removes those prefixes.
+            tf_weights_dict = {}
+            for v in model_to_export.trainable_variables:
+                original_name = v.name
+                cleaned_name = original_name
+
+                # 1. Remove the pruning wrapper prefix, e.g., "prune_low_magnitude_policy/dense/..."
+                if cleaned_name.startswith('prune_low_magnitude_'):
+                    cleaned_name = cleaned_name.replace('prune_low_magnitude_', '', 1)
+
+                # 2. Remove the checkpoint wrapper prefix, e.g., "encoder_0/checkpoint/..."
+                cleaned_name = re.sub(r'encoder_\d+/checkpoint/', '', cleaned_name)
+
+                tf_weights_dict[cleaned_name] = v.numpy()
+
+            net = Net(net_fmt=pb.NetworkFormat.NETWORK_MAMBA2_WITH_HEADFORMAT)
+            net.set_input(pb.NetworkFormat.INPUT_112_WITH_CANONICALIZATION_V2)
+            net.set_valueformat(pb.NetworkFormat.VALUE_WDL)
+            net.populate_from_tf_weights(tf_weights_dict)
+            filepath = os.path.join(self.root_dir, f"{self.cfg['name']}-step{step}.pb.gz")
+            net.save_proto(filepath)
+            print(f"Successfully exported to {filepath}")
+        except Exception as e:
+            print(f"ERROR during .pb.gz export: {e}")
+            traceback.print_exc()
+    
+    def create_dummy_dataset(self, batch_size):
+        def generator():
+            while True:
+                us = np.random.randn(batch_size, 112, 8, 8).astype(np.float32) * 0.1
+                pi = np.random.rand(batch_size, 1858).astype(np.float32)
+                pi = pi / np.sum(pi, axis=1, keepdims=True)
+                wdl = np.zeros((batch_size, 3), dtype=np.float32)
+                for i in range(batch_size): 
+                    wdl[i, np.random.randint(0, 3)] = 1.0
+                q = np.random.randn(batch_size, 1).astype(np.float32)
+                st_q = np.random.randn(batch_size, 1).astype(np.float32)
+                yield us, pi, wdl, q, st_q
+        return tf.data.Dataset.from_generator(
+            generator, 
+            output_signature=(
+                tf.TensorSpec(shape=(batch_size, 112, 8, 8), dtype=tf.float32),
+                tf.TensorSpec(shape=(batch_size, 1858), dtype=tf.float32),
+                tf.TensorSpec(shape=(batch_size, 3), dtype=tf.float32),
+                tf.TensorSpec(shape=(batch_size, 1), dtype=tf.float32),
+                tf.TensorSpec(shape=(batch_size, 1), dtype=tf.float32),
+            )
+        )
+    
     def restore(self):
         if self.manager.latest_checkpoint:
             print(f"Restoring from {self.manager.latest_checkpoint}...")
             self.checkpoint.restore(self.manager.latest_checkpoint).expect_partial()
-            print(f"Restore complete. Global step is {self.global_step.numpy()}.")
-        else:
-            print("No checkpoint found, starting from scratch.")
-
-    def save_leelaz_weights(self, filename):
-        print("Saving Leela-style weights...")
-        
-        # Create weight mappings for the protobuf format
-        weight_mappings = self.create_weight_mappings()
-        weights_to_process = {}
-        
-        # Collect all weights, EXCLUDING RoPE weights which are not saved.
-        for w in self.model.weights:
-            # RoPE embeddings are fixed and recalculated by the engine. Do not save them.
-            if 'rotary_position_embedding2d' in w.name:
-                print(f"  Skipping non-saved weight: '{w.name}'")
-                continue
-            weights_to_process[w.name] = w.numpy()
-            
-        # Apply custom mappings first
-        for tf_name, pb_setter in weight_mappings.items():
-            if tf_name in weights_to_process:
-                try:
-                    pb_setter(weights_to_process[tf_name])
-                    print(f"  Mapped '{tf_name}' to protobuf structure")
-                    # Remove from dict so it's not processed by legacy parser
-                    del weights_to_process[tf_name]
-                except Exception as e:
-                    print(f"  WARNING: Failed to map '{tf_name}': {e}. Will use legacy parser.")
-        
-        # Use legacy parser for remaining weights (Mamba blocks, heads, etc.)
-        if weights_to_process:
-            print(f"  Using legacy parser for {len(weights_to_process)} remaining weights...")
+    
+    def evaluate(self):
+        print(f"Running evaluation for {self.tcfg['test_steps']} steps...")
+        test_losses = {'total': [], 'policy': [], 'value_winner': []}
+        for _ in range(self.tcfg['test_steps']):
             try:
-                self.net.populate_from_tf_weights(weights_to_process)
-            except Exception as e:
-                print(f"  WARNING: Legacy parser failed: {e}")
-        
-        # Save the protobuf
-        self.net.save_proto(filename) # save_proto now prints its own success message
-        print("Weight saving complete.")
-
-
-    def create_weight_mappings(self):
-        """
-        Create mappings from TensorFlow weight names to protobuf setters.
-        This handles weights that the legacy parser in net.py doesn't know about.
-        """
-        mappings = {}
-        
-        # The input layer `input/dense` maps to the `input` ConvBlock in the proto.
-        # We need to map its kernel and bias to the `weights` and `biases` fields
-        # within that ConvBlock. We use the `fill_layer` helper from the Net class.
-        
-        def set_input_weights(value):
-            target_pb_layer = self.net.pb.weights.input.weights
-            self.net.fill_layer(target_pb_layer, value)
-            
-        def set_input_biases(value):
-            target_pb_layer = self.net.pb.weights.input.biases
-            self.net.fill_layer(target_pb_layer, value)
-
-        mappings['input/dense/kernel:0'] = set_input_weights
-        mappings['input/dense/bias:0'] = set_input_biases
-        
-        # RoPE weights ('rotary_position_embedding2d/*') are NOT mapped because
-        # they are not present in the protobuf schema and are meant to be
-        # regenerated by the engine from config parameters.
-        
-        return mappings
-
-    def construct_net(self, inputs):
-        mcfg = self.mcfg
-        flow = tf.transpose(tf.cast(inputs, tf.float32), [0, 2, 3, 1])
-        flow = tf.reshape(flow, [-1, 64, tf.shape(inputs)[1]])
-        embedding_size = mcfg['embedding_size']
-        flow = tf.keras.layers.Dense(embedding_size, name="input/dense", activation=None, kernel_initializer=tf.keras.initializers.HeNormal(seed=44))(flow)
-        flow = tf.nn.relu(tf.clip_by_value(flow, 0.0, 10.0))
-        if self.net_type == 'mamba2':
-            if mcfg.get('rope_2d_enabled', False):
-                r_in = tf.reshape(flow, (-1, 64, mcfg['mamba2_num_heads'], mcfg['mamba2_head_dim']))
-                r_out = RotaryPositionEmbedding2D(mcfg['mamba2_head_dim'], mcfg.get('rope_2d_theta', 10000.0), name='rotary_position_embedding2d')(tf.transpose(r_in, [0, 2, 1, 3]))
-                flow = tf.reshape(tf.transpose(r_out, [0, 2, 1, 3]), (-1, 64, embedding_size))
-            for i in range(mcfg['encoder_layers']):
-                flow_prev = flow
-                flow = Mamba2Block(embedding_size, mcfg['mamba2_d_state'], mcfg['mamba2_d_conv'], mcfg['mamba2_expand_factor'], mcfg['mamba2_dt_rank'], name=f"encoder_{i}/mamba2")(flow)
-                flow = tf.where(tf.math.is_finite(flow), flow, flow_prev * 0.9)
-        
-        # --- FIXED SECTION ---
-        # 1. Instantiate the layer ONCE
-        pooling_layer = tf.keras.layers.GlobalAveragePooling1D(name="avg_pool")
-        
-        # 2. Call the layer on the input tensor to get the output
-        pooled_flow_tensor = pooling_layer(flow)
-        
-        # 3. Use the TENSOR (not the layer call) in your logic for NaN safety
-        pooled_flow = tf.where(tf.math.is_finite(pooled_flow_tensor), pooled_flow_tensor, tf.zeros_like(pooled_flow_tensor))
-
-        policy_logits = tf.keras.layers.Dense(1858, name="policy/dense", kernel_initializer=tf.keras.initializers.HeNormal(seed=45))(pooled_flow)
-        value_logits = tf.keras.layers.Dense(3 if mcfg['value'] == 'wdl' else 1, name="value/dense", kernel_initializer=tf.keras.initializers.HeNormal(seed=46))(pooled_flow)
-        return {'policy': tf.cast(policy_logits, tf.float32), 'value_winner': tf.cast(value_logits, tf.float32)}
-
-    def safe_cross_entropy(self, labels, logits):
-        labels = tf.nn.relu(labels)
-        label_sum = tf.reduce_sum(labels, axis=-1, keepdims=True)
-        labels = tf.where(label_sum > 1e-8, labels / (label_sum + 1e-8), tf.ones_like(labels) / tf.cast(tf.shape(labels)[-1], labels.dtype))
-        return tf.nn.softmax_cross_entropy_with_logits(labels=labels, logits=tf.clip_by_value(logits, -20.0, 20.0))
-
-    @tf.function
-    def train_step(self, x, y, z):
-        x, y, z = [tf.where(tf.math.is_finite(t), t, tf.zeros_like(t)) for t in [x,y,z]]
-        with tf.GradientTape() as tape:
-            predictions = self.model(x, training=True)
-            policy_pred = tf.where(tf.math.is_finite(predictions['policy']), predictions['policy'], tf.zeros_like(predictions['policy']))
-            value_pred = tf.where(tf.math.is_finite(predictions['value_winner']), predictions['value_winner'], tf.zeros_like(predictions['value_winner']))
-            policy_loss = tf.reduce_mean(self.safe_cross_entropy(y, policy_pred))
-            value_loss = tf.reduce_mean(self.safe_cross_entropy(z, value_pred))
-            policy_loss = tf.where(tf.math.is_finite(policy_loss), policy_loss, 10.0) 
-            value_loss = tf.where(tf.math.is_finite(value_loss), value_loss, 1.0)
-            total_loss = policy_loss + value_loss
-            l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in self.model.trainable_variables if 'bias' not in v.name and 'norm' not in v.name])
-            total_loss += self.weight_decay * tf.where(tf.math.is_finite(l2_loss), l2_loss, 0.0)
-            total_loss = tf.where(tf.math.is_finite(total_loss), total_loss, 11.0)
-        gradients = tape.gradient(total_loss, self.model.trainable_variables)
-        safe_grads = [(tf.where(tf.math.is_finite(g), g, tf.zeros_like(g)), v) for g, v in zip(gradients, self.model.trainable_variables) if g is not None]
-        self.optimizer.apply_gradients(safe_grads)
-        return total_loss, policy_loss, value_loss
-
-    def process_loop(self, total_batch_size, num_evals, batch_splits):
+                batch_data = next(self.test_iter, None)
+                if batch_data is None: 
+                    self.test_iter = iter(self.test_ds)
+                    batch_data = next(self.test_iter, None)
+                if batch_data is None: 
+                    break
+                us, pi, wdl, q, st_q = batch_data
+                input_dict = {'us': us, 'pi': pi, 'wdl': wdl}
+                losses = self.test_step(input_dict)
+                for k, v in losses.items(): 
+                    test_losses[k].append(v.numpy())
+            except Exception as e: 
+                print(f"Error during evaluation step: {e}")
+                continue
+        avg_losses = {k: np.mean(v) for k, v in test_losses.items() if v}
+        return avg_losses
+    
+    def debug_data_source(self):
+        print(f"=== DEBUGGING DATA SOURCE ===")
+        train_dirs = self.tcfg['train_dir']
+        if not isinstance(train_dirs, list): 
+            train_dirs = [train_dirs]
+        print(f"Train Dirs: {train_dirs}")
+        print(f"Test Dir: {self.tcfg.get('test_dir', 'Not specified')}")
+        print(f"Batch size: {self.tcfg['batch_size']}")
+        total_files = 0
+        all_dirs_ok = True
+        for train_dir in train_dirs:
+            print(f"\n--- Checking directory: {train_dir} ---")
+            if not os.path.exists(train_dir): 
+                print(f"ERROR: Train directory does not exist: {train_dir}")
+                all_dirs_ok = False
+                continue
+            try:
+                files = os.listdir(train_dir)
+                print(f"Found {len(files)} files in this directory.")
+                if not files: 
+                    print(f"WARNING: Directory is empty: {train_dir}")
+                    continue
+                total_files += len(files)
+                print(f"  First few files: {files[:5]}")
+                for filename in files[:3]:
+                    filepath = os.path.join(train_dir, filename)
+                    size = os.path.getsize(filepath)
+                    print(f"    - {filename}: {size:,} bytes")
+                    if size == 0: 
+                        print(f"      WARNING: File {filename} is empty!")
+            except Exception as e: 
+                print(f"ERROR: Could not access directory {train_dir}. Reason: {e}")
+                all_dirs_ok = False
+                continue
+        if not all_dirs_ok: 
+            print("\nERROR: One or more directories could not be accessed.")
+            return False
+        if total_files == 0: 
+            print("\nERROR: No training files found in any of the specified directories.")
+            return False
+        print(f"\nSuccessfully checked all directories. Found a total of {total_files} files.")
+        return True
+    
+    def process_loop(self):
         os.makedirs(self.root_dir, exist_ok=True)
         os.makedirs("leelalogs", exist_ok=True)
         print(f"Starting training for {self.tcfg['total_steps']} steps...")
-        consecutive_nan_count, max_consecutive_nans = 0, 5
+        if not self.tcfg.get('use_dummy_data', False) and not self.debug_data_source(): 
+            print("Data source debugging failed. Cannot continue training.")
+            return
         last_log_time = time.time()
+        consecutive_zero_batches = 0
+        max_zero_batches = 10
+        
+        if self.use_sparsity: 
+            self.pruning_callback.set_model(self.model)
+            self.pruning_callback.on_train_begin()
+        
+        try:
+            sample_batch = next(self.train_iter)
+            us, pi, wdl, q, st_q = sample_batch
+            print(f"Sample batch shapes - US: {us.shape}, PI: {pi.shape}, WDL: {wdl.shape}")
+            if (tf.reduce_sum(tf.abs(us)) < 1e-8 and tf.reduce_sum(tf.abs(pi)) < 1e-8 and 
+                tf.reduce_sum(tf.abs(wdl)) < 1e-8): 
+                print("ERROR: All sample data is zeros!")
+                return
+            self.train_iter = iter(self.train_ds)
+        except StopIteration: 
+            print("ERROR: Data iterator is empty. No data found.")
+            return
+        except Exception as e: 
+            print(f"Error during data validation step: {e}")
+            traceback.print_exc()
+            return
+        
         while self.global_step.numpy() < self.tcfg['total_steps']:
             try:
                 batch_data = next(self.train_iter, None)
-                if batch_data is None: print("Training data iterator exhausted. Stopping."); break
-                x, y, z = batch_data[0], batch_data[1], batch_data[2]
-                total_loss, policy_loss, value_loss = self.train_step(x, y, z)
-                total_loss_val, policy_loss_val, value_loss_val = total_loss.numpy(), policy_loss.numpy(), value_loss.numpy()
-                if np.isnan(total_loss_val) or np.isinf(total_loss_val):
-                    consecutive_nan_count += 1
-                    print(f"Step {self.global_step.numpy():6d}, NaN/Inf detected in loss (count: {consecutive_nan_count}). Skipping step.")
-                    if consecutive_nan_count >= max_consecutive_nans: print("Too many consecutive NaN losses, stopping training."); self.validate_model_weights(); break
+                if batch_data is None: 
+                    print("Training data iterator exhausted, recreating...")
+                    self.train_iter = iter(self.train_ds)
+                    batch_data = next(self.train_iter, None)
+                if batch_data is None: 
+                    print("Failed to get batch data after recreating iterator. Stopping.")
+                    break
+                us, pi, wdl, q, st_q = batch_data
+                if tf.reduce_sum(tf.abs(pi)) < 1e-8:
+                    consecutive_zero_batches += 1
+                    print(f"Warning: Policy targets are all zeros, skipping batch (count: {consecutive_zero_batches})")
+                    if consecutive_zero_batches >= max_zero_batches: 
+                        print(f"ERROR: Got {consecutive_zero_batches} consecutive zero batches. Data pipeline is broken!")
+                        break
                     continue
-                else: consecutive_nan_count = 0
-                self.global_step.assign_add(1)
-                current_step = self.global_step.numpy()
-                if current_step % 100 == 0:
-                    end_time = time.time()
-                    sps = 100 / (end_time - last_log_time)
-                    last_log_time = end_time
-                    print(f"Step {current_step:6d}, Loss: {total_loss_val:.4f} (P: {policy_loss_val:.4f}, V: {value_loss_val:.4f}), SPS: {sps:.2f}")
-                if current_step > 0 and current_step % self.tcfg.get("checkpoint_steps", 1000) == 0:
-                    save_path = self.manager.save(checkpoint_number=current_step)
-                    print(f"Checkpoint saved to {save_path}")
-                    weights_filename = f"{self.root_dir}/{self.cfg['name']}-{current_step}.pb.gz"
-                    self.save_leelaz_weights(weights_filename)
-            except (tf.errors.InvalidArgumentError, tf.errors.OpError) as e:
-                print(f"TensorFlow error at step {self.global_step.numpy()}: {e}. Attempting to skip batch."); self.validate_model_weights(); continue
+                else: 
+                    consecutive_zero_batches = 0
+                
+                input_dict = {'us': us, 'pi': pi, 'wdl': wdl}
+                losses = self.train_step(input_dict)
+                step = self.global_step.numpy()
+                
+                if self.use_sparsity: 
+                    self.pruning_callback.on_epoch_end(batch=step)
+                
+                log_steps = self.tcfg.get("train_avg_report_steps", 100)
+                if step % log_steps == 0 and step > 0:
+                    sps = log_steps / (time.time() - last_log_time) if time.time() > last_log_time else 0
+                    last_log_time = time.time()
+                    loss_str = ", ".join([f"{name.upper()}: {value.numpy():.6f}" for name, value in losses.items()])
+                    inner_lr_attr = self.optimizer.inner_optimizer.learning_rate
+                    if isinstance(inner_lr_attr, tf.keras.optimizers.schedules.LearningRateSchedule): 
+                        current_lr = inner_lr_attr(step).numpy()
+                    else: 
+                        current_lr = inner_lr_attr.numpy()
+                    print(f"Step {step:6d}, LR: {current_lr:.6f}, Losses: [ {loss_str} ], SPS: {sps:.2f}")
+                
+                checkpoint_steps = self.tcfg.get("checkpoint_steps", 1000)
+                if step > 0 and step % checkpoint_steps == 0:
+                    self.manager.save(checkpoint_number=step)
+                    self.export_leela_weights(step)
+                    test_losses = self.evaluate()
+                    if test_losses:
+                        test_loss_str = ", ".join([f"Test {name.upper()}: {value:.6f}" for name, value in test_losses.items()])
+                        print(f"Step {step:6d}, Evaluation Results: [ {test_loss_str} ]")
             except Exception as e:
-                print(f"Unexpected error at step {self.global_step.numpy()}: {e}"); traceback.print_exc(); print("Attempting to continue..."); continue
+                print(f"Unexpected error at step {self.global_step.numpy()}: {e}")
+                traceback.print_exc()
+                continue
         print("Training finished.")
-        current_step = self.global_step.numpy()
-        final_save_path = self.manager.save(checkpoint_number=current_step)
-        print(f"Final checkpoint saved to {final_save_path}")
-        final_weights_filename = f"{self.root_dir}/{self.cfg['name']}-{current_step}.pb.gz"
-        self.save_leelaz_weights(final_weights_filename)
-
-    def validate_model_weights(self):
-        print("Validating model weights for NaN/Inf values...")
-        nan_weights, inf_weights = [], []
-        for weight in self.model.weights:
-            if np.any(np.isnan(weight.numpy())): nan_weights.append(weight.name)
-            if np.any(np.isinf(weight.numpy())): inf_weights.append(weight.name)
-        if nan_weights: print(f"WARNING: NaN values found in weights: {nan_weights}")
-        if inf_weights: print(f"WARNING: Inf values found in weights: {inf_weights}")
-        if not nan_weights and not inf_weights: print("All weights are finite.")
-
