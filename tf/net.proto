@@ -33,10 +33,35 @@ message Weights {
   message EncoderBlock { oneof block_type { AttentionBlock attention=1; Mamba2Block mamba2=2; } }
 
   // --- Head Definitions ---
-  message PolicyHead { optional Layer ip_pol_w=1; optional Layer ip_pol_b=2; optional Layer ip2_pol_w=3; optional Layer ip2_pol_b=4; optional Layer ip3_pol_w=5; optional Layer ip3_pol_b=6; optional Layer ip4_pol_w=7; }
-  message ValueHead { optional Layer ip_val_w=1; optional Layer ip_val_b=2; optional Layer ip1_val_w=3; optional Layer ip1_val_b=4; optional Layer ip2_val_w=5; optional Layer ip2_val_b=6; }
-  message PolicyHeads { optional PolicyHead vanilla=3; }
-  message ValueHeads { optional ValueHead winner=1; optional ValueHead q=2; optional ValueHead st=3; }
+  message PolicyHead {
+    optional Layer ip_pol_w=1; optional Layer ip_pol_b=2;
+    optional Layer ip2_pol_w=3; optional Layer ip2_pol_b=4;
+    optional Layer ip3_pol_w=5; optional Layer ip3_pol_b=6;
+    optional Layer ip4_pol_w=7;
+  }
+
+  // UPDATED ValueHead to include error and categorical fields
+  message ValueHead {
+    optional Layer ip_val_w = 1; optional Layer ip_val_b = 2;
+    optional Layer ip1_val_w = 3; optional Layer ip1_val_b = 4;
+    optional Layer ip2_val_w = 5; optional Layer ip2_val_b = 6;
+    // Fields for value error prediction head
+    optional Layer ip_val_err_w = 7; optional Layer ip_val_err_b = 8;
+    // Fields for categorical value head (for future use/consistency)
+    optional Layer ip_val_cat_w = 9; optional Layer ip_val_cat_b = 10;
+  }
+  
+  // UPDATED PolicyHeads to include optimistic_st
+  message PolicyHeads {
+    optional PolicyHead vanilla = 3;
+    optional PolicyHead optimistic_st = 4;
+  }
+
+  message ValueHeads {
+    optional ValueHead winner = 1;
+    optional ValueHead q = 2;
+    optional ValueHead st = 3;
+  }
 
   // --- Main Weights Structure ---
   optional ConvBlock input = 1;
